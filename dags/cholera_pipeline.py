@@ -135,6 +135,17 @@ def cholera_pipeline():
             df["hospitalised_no"] = df["hospitalised_no"].map({"Outpatient": "outpatient", "Inpatient": "inpatient"}).fillna("missing")
             df["level_of_hydration"] = df["level_of_hydration"].map({"Severe":"severe", "Moderate":"moderate", "Mild":"mild", "Severe dehydration":"severe_dehydration", "High":"high"}).fillna("missing")
             df["age"] = np.ceil(pd.to_numeric(df["age"], errors="coerce")).astype("Int64")
+            df["labresults_rdt"] = df["labresults_rdt"].map({"Positive":"positive", "Negative":"negative","Pending":"pending","Not Done":"not_done"}).fillna(pd.NA)
+            df["labresults_cul"] = df["labresults_cul"].map({"Positive":"positive", "Negative":"negative","Pending":"pending","Not Done":"not_done"}).fillna(pd.NA)
+            
+            if "labresults_rdt" in df.columns and "labresults_cul" in df.columns:
+                df["case_classification"] = np.where(
+                        (df["labresults_rdt"].str.lower() == "positive") | (df["labresults_cul"].str.lower() == "positive"), "confirmed",
+                    np.where(
+                        df["labresults_rdt"].isna() & df["labresults_cul"].isna(), "missing",
+                        "suspected"
+                    )
+                )
             
             return df.to_dict("records")
         except Exception as e:
@@ -337,14 +348,14 @@ def cholera_pipeline():
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["epid_number", "disease_id", "date_of_onset", "sex", "age", "lga_id", "state_id","outcome","hospitalised_no", "source_system", "case_version"]
+            required_cols = ["epid_number", "disease_id", "date_of_onset", "sex", "age", "lga_id", "state_id","case_classification","outcome","hospitalised_no", "source_system", "case_version"]
 
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "outcome", "hospitalisation_status", "source_system", "case_version"]
+            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification", "outcome", "hospitalisation_status", "source_system", "case_version"]
             
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
@@ -359,6 +370,7 @@ def cholera_pipeline():
                 age INT,
                 lga_id INT, 
                 state_id INT,
+                case_classification VARCHAR(50),
                 outcome VARCHAR(50),
                 hospitalisation_status VARCHAR(50),
                 source_system INT,
@@ -373,7 +385,7 @@ def cholera_pipeline():
             cur.copy_expert("""
             COPY tmp_core_case_fact
             (epid_number,disease_id,onset_date,sex,age,
-            lga_id,state_id,outcome,hospitalisation_status,
+            lga_id,state_id,case_classification,outcome,hospitalisation_status,
             source_system,case_version)
             FROM STDIN WITH CSV
             """, buffer)
@@ -381,10 +393,10 @@ def cholera_pipeline():
             cur.execute("""
             INSERT INTO core_case_fact
             (epid_number,disease_id,onset_date,sex,age,
-            lga_id,state_id,outcome,hospitalisation_status,
+            lga_id,state_id,case_classification,outcome,hospitalisation_status,
             source_system,case_version)
             SELECT epid_number,disease_id,onset_date,sex,age,
-                lga_id,state_id,outcome,hospitalisation_status,
+                lga_id,state_id,case_classification,outcome,hospitalisation_status,
                 source_system,case_version
             FROM tmp_core_case_fact
             ON CONFLICT (epid_number) DO UPDATE
@@ -395,6 +407,7 @@ def cholera_pipeline():
                 age = EXCLUDED.age,
                 lga_id = EXCLUDED.lga_id,
                 state_id = EXCLUDED.state_id,
+                case_classification = EXCLUDED.case_classification,
                 outcome = EXCLUDED.outcome,
                 hospitalisation_status = EXCLUDED.hospitalisation_status,
                 source_system = EXCLUDED.source_system,
