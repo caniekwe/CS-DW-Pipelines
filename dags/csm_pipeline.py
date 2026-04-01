@@ -166,8 +166,7 @@ def csm_pipeline():
             df = pd.DataFrame(records)
             dag_run = context["dag_run"]   
             ti = context["task_instance"]     
-            rec_no = len(df)
-            valid_rows = []
+          #  valid_rows = []
             failures = []
             
             for idx, row in df.iterrows():
@@ -183,7 +182,8 @@ def csm_pipeline():
                     elif pd.isna(row.get("epid_number")):
                         failures.append((int(idx),"Missing Epid number",dag_run.run_id, ti.dag_id))
                     else:
-                        valid_rows.append(row)
+                        pass
+                       # valid_rows.append(row)
                 except Exception as row_error:
                     print(f"Row {idx} failed with error: {row_error}")
                     failures.append((int(idx),f"Row processing error: {str(row_error)}",dag_run.run_id, ti.dag_id))
@@ -210,7 +210,7 @@ def csm_pipeline():
                         except:
                             pass
 
-            df_valid = make_xcom_safe(pd.DataFrame(valid_rows))
+            df_valid = make_xcom_safe(df)
             
             return df_valid.to_dict("records")
             
@@ -343,17 +343,17 @@ def csm_pipeline():
             
             df = pd.DataFrame(records)
 
-            for col in ["lga_id", "state_id"]:
+            for col in ["lga_id", "state_id","age","epi_week"]:
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["epid_number", "disease_id", "date_of_symptom_onset_mm_dd_yyyy", "gender", "age", "lga_id", "state_id","case_classification","admitted_as_inpatient", "source_system", "case_version"]
+            required_cols = ["epid_number", "disease_id", "date_of_symptom_onset_mm_dd_yyyy", "gender", "age", "lga_id", "state_id","case_classification","admitted_as_inpatient", "source_system", "case_version", "epi_week"]
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification", "hospitalisation_status", "source_system", "case_version"]
+            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification", "hospitalisation_status", "source_system", "case_version", "epi_week"]
             
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
@@ -362,7 +362,7 @@ def csm_pipeline():
             cur.execute("""
             CREATE TEMP TABLE tmp_core_case_fact (
                 epid_number VARCHAR(50), disease_id INT, onset_date DATE, sex VARCHAR(10),
-                age INT, lga_id INT, state_id INT, case_classification VARCHAR(50), hospitalisation_status VARCHAR(50), source_system INT, case_version INT
+                age INT, lga_id INT, state_id INT, case_classification VARCHAR(50), hospitalisation_status VARCHAR(50), source_system INT, case_version INT,  epi_week INT
             ) ON COMMIT DROP
             """)
             
@@ -371,13 +371,13 @@ def csm_pipeline():
             buffer.seek(0)
 
             cur.copy_expert("""
-            COPY tmp_core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id, state_id, case_classification,hospitalisation_status, source_system,case_version)
+            COPY tmp_core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id, state_id, case_classification,hospitalisation_status, source_system,case_version,epi_week)
             FROM STDIN WITH CSV
             """, buffer)
 
             cur.execute("""
-            INSERT INTO core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,hospitalisation_status,source_system,case_version)
-            SELECT epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,hospitalisation_status, source_system,case_version
+            INSERT INTO core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,hospitalisation_status,source_system,case_version,epi_week)
+            SELECT epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,hospitalisation_status, source_system,case_version,epi_week
             FROM tmp_core_case_fact
             ON CONFLICT (epid_number) DO UPDATE SET 
                         disease_id = EXCLUDED.disease_id, 
@@ -389,7 +389,8 @@ def csm_pipeline():
                         case_classification = EXCLUDED.case_classification,
                         hospitalisation_status = EXCLUDED.hospitalisation_status, 
                         source_system = EXCLUDED.source_system, 
-                        case_version = EXCLUDED.case_version            
+                        case_version = EXCLUDED.case_version,
+                        epi_week = EXCLUDED.epi_week            
             RETURNING case_fact_id, epid_number
             """)
 

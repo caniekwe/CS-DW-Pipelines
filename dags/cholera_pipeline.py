@@ -164,7 +164,7 @@ def cholera_pipeline():
             dag_run = context["dag_run"]   
             ti = context["task_instance"]     
 
-            valid_rows = []
+           # valid_rows = []
             failures = []
             
             for idx, row in df.iterrows():
@@ -180,7 +180,8 @@ def cholera_pipeline():
                     elif pd.isna(row.get("epid_number")):
                         failures.append((int(idx),"Missing Epid number",dag_run.run_id, ti.dag_id))
                     else:
-                        valid_rows.append(row)
+                        # valid_rows.append(row)
+                        pass
                 except Exception as row_error:
                     print(f"Row {idx} failed with error: {row_error}")
                     failures.append((int(idx),f"Row processing error: {str(row_error)}",dag_run.run_id, ti.dag_id))
@@ -207,7 +208,7 @@ def cholera_pipeline():
                         except:
                             pass
 
-            df_valid = make_xcom_safe(pd.DataFrame(valid_rows))
+            df_valid = make_xcom_safe(df)
             
             return df_valid.to_dict("records")
             
@@ -344,18 +345,18 @@ def cholera_pipeline():
             
             df = pd.DataFrame(records)
 
-            for col in ["lga_id", "state_id"]:
+            for col in ["lga_id", "state_id","age","wk","yr"]:
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["epid_number", "disease_id", "date_of_onset", "sex", "age", "lga_id", "state_id","case_classification","outcome","hospitalised_no", "source_system", "case_version"]
+            required_cols = ["epid_number", "disease_id", "date_of_onset", "sex", "age", "lga_id", "state_id","case_classification","outcome","hospitalised_no", "source_system", "case_version","wk","yr"]
 
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification", "outcome", "hospitalisation_status", "source_system", "case_version"]
+            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification", "outcome", "hospitalisation_status", "source_system", "case_version","wk","yr"]
             
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
@@ -374,7 +375,9 @@ def cholera_pipeline():
                 outcome VARCHAR(50),
                 hospitalisation_status VARCHAR(50),
                 source_system INT,
-                case_version INT
+                case_version INT,
+                epi_week INT,
+                epi_year INT
             ) ON COMMIT DROP
             """)
             
@@ -386,7 +389,7 @@ def cholera_pipeline():
             COPY tmp_core_case_fact
             (epid_number,disease_id,onset_date,sex,age,
             lga_id,state_id,case_classification,outcome,hospitalisation_status,
-            source_system,case_version)
+            source_system,case_version,epi_week, epi_year)
             FROM STDIN WITH CSV
             """, buffer)
 
@@ -394,10 +397,10 @@ def cholera_pipeline():
             INSERT INTO core_case_fact
             (epid_number,disease_id,onset_date,sex,age,
             lga_id,state_id,case_classification,outcome,hospitalisation_status,
-            source_system,case_version)
+            source_system,case_version,epi_week, epi_year)
             SELECT epid_number,disease_id,onset_date,sex,age,
                 lga_id,state_id,case_classification,outcome,hospitalisation_status,
-                source_system,case_version
+                source_system,case_version,epi_week, epi_year
             FROM tmp_core_case_fact
             ON CONFLICT (epid_number) DO UPDATE
             SET
@@ -411,7 +414,9 @@ def cholera_pipeline():
                 outcome = EXCLUDED.outcome,
                 hospitalisation_status = EXCLUDED.hospitalisation_status,
                 source_system = EXCLUDED.source_system,
-                case_version = EXCLUDED.case_version            
+                case_version = EXCLUDED.case_version,
+                epi_week = EXCLUDED.epi_week,
+                epi_year = EXCLUDED.epi_year           
             RETURNING case_fact_id, epid_number
             """)
 
