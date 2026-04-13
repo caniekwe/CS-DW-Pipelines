@@ -6,6 +6,76 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 import io
+import re
+
+
+
+def clean_date_columns(df, date_cols, return_report=True):
+
+    def parse_excel_serial(x):
+        try:
+            val = float(x)
+            if val > 10000:  # heuristic threshold
+                return pd.to_datetime(val, origin='1899-12-30', unit='D')
+        except:
+            pass
+        return None
+
+    def parse_mixed_date(x):
+        if pd.isna(x):
+            return pd.NaT
+
+        x = str(x).strip()
+
+        # Remove unwanted characters
+        x = re.sub(r'[^0-9/\-]', '', x)
+
+        # Try Excel serial
+        serial = parse_excel_serial(x)
+        if serial is not None:
+            return serial
+
+        # Heuristic for dd/mm vs mm/dd
+        try:
+            parts = re.split(r'[/-]', x)
+            if len(parts) == 3:
+                p1, p2, _ = parts
+                if int(p1) > 12:
+                    return pd.to_datetime(x, dayfirst=True, errors='coerce')
+                elif int(p2) > 12:
+                    return pd.to_datetime(x, dayfirst=False, errors='coerce')
+        except:
+            pass
+
+        # Fallback
+        return pd.to_datetime(x, format='mixed', errors='coerce')
+
+    report = {}
+
+    for col in date_cols:
+        # Force to string to avoid mixed dtype issues
+        df[col] = df[col].astype(str)
+
+        cleaned_col = f"{col}_clean"
+
+        df[cleaned_col] = df[col].apply(parse_mixed_date)
+
+        # Data quality metrics
+        total = len(df)
+        nulls = df[cleaned_col].isna().sum()
+
+        report[col] = {
+            "total_rows": total,
+            "invalid_dates": int(nulls),
+            "valid_dates": int(total - nulls),
+            "invalid_pct": round(nulls / total * 100, 2)
+        }
+
+    if return_report:
+        return df, report
+
+    return df
+
 
 
 DAG_ID = "csm_linelist_pipeline"
@@ -134,22 +204,38 @@ def csm_pipeline():
             
             for col in ["date_of_symptom_onset_mm_dd_yyyy", "date_of_report_dd_mm_yyyy"]:
                 if col in df.columns and df[col].dtype == 'object':
-                    df[col] = pd.to_datetime(df[col], errors="coerce").dt.date.where(pd.to_datetime(df[col], errors="coerce").notna(), None)
+                    df[col] = df[col].astype(str)
+                    df[col] = pd.to_datetime(df[col], dayfirst=True, format="mixed", errors="coerce").dt.date
+                    df[col] = df[col].replace({pd.NaT: None})
             
+            df["epi_year"] = pd.to_datetime(df["date_of_symptom_onset_mm_dd_yyyy"], errors="coerce").dt.isocalendar().year
+            df["epi_week_calculated"] =np.where(df['date_of_symptom_onset_mm_dd_yyyy'].notnull(), pd.to_datetime(df["date_of_symptom_onset_mm_dd_yyyy"], errors="coerce").dt.isocalendar().week, df['epi_week'].astype("Int64"))
+            #df["epi_week_calculated"] = pd.to_datetime(df["date_of_symptom_onset_mm_dd_yyyy"], errors="coerce").dt.isocalendar().week
+
+            if "gender" in df.columns:
+                df["gender"] = df["gender"].str.strip().str.lower()
+                df["gender"] = df["gender"].map({"m": "male", "f": "female"}).fillna("missing")
             if "vaccination" in df.columns:
                 df["vaccination"] = df["vaccination"].map({"Unknown": "unknown", "Vaccinated": "vaccinated", "Not Vaccinated": "unvaccinated"}).fillna("missing")
             if "vaccinated_men5doses" in df.columns:
                 df["vaccinated_men5doses"] = df["vaccinated_men5doses"].map({"Vaccinated": "vaccinated", "Not Vaccinated": "unvaccinated", "Unvaccinated": "unvaccinated","Not applicable": "not applicable"}).fillna("missing")
             if "sample_collected" in df.columns:
                 df["sample_collected"] = df["sample_collected"].map({"Yes": True, "No": False}).astype("boolean").fillna(pd.NA)
+            if "outcome_of_case" in df.columns:
+                df["outcome_of_case"] = df["outcome_of_case"].str.strip().str.lower().fillna("missing")
+                
+                #df["outcome_of_case"] = df["outcome_of_case"].map({"alive":"Alive", "dead":"Dead"}).fillna("missing")
+            
             if "admitted_inpatient" in df.columns:
                 df["admitted_inpatient"] = df["admitted_inpatient"].map({"In": "inpatient", "In patient": "inpatient","inpatient": "inpatient","outpatient": "outpatient","out-patient": "outpatient"}).fillna("missing")
             if "result_positive_negative" in df.columns:
-                df["result_positive_negative"] = df["result_positive_negative"].map({"Positive": "positive","POSITIVE": "positive", "Negative": "negative","NEGATIVE": "negative","AWAITING": "pending","PENDING": "pending","NA": "not applicable"}).fillna("missing")          
+                df["result_positive_negative"] = df["result_positive_negative"].str.strip().str.lower()
+                df["result_positive_negative"] = df["result_positive_negative"].map({"awaiting": "pending","NA": "not applicable"}).fillna(df["result_positive_negative"])          
 
                 df["case_classification"] = np.where(df["result_positive_negative"] == "positive", "confirmed",
                                             np.where(df["result_positive_negative"].isna(), "missing", "suspected"))
 
+            df = make_xcom_safe(df)
             return df.to_dict("records")
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
@@ -265,11 +351,17 @@ def csm_pipeline():
                 raise Exception("No LGAs found in master_lga table")
 
             if "state" in df.columns:
+                df["state"] = df["state"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
+                df["state"] = df["state"].map({"fct": "federal capital territory"}).fillna(df["state"])
+                states["state_name"] = states["state_name"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
                 df = df.merge(states, left_on="state", right_on="state_name", how="left")
             else:
                 raise Exception("Missing 'state' column in data")
 
             if "lga" in df.columns and "state_id" in df.columns:
+                df["lga"] = df["lga"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
+                df["lga"] = df["lga"].map({"kirikasamma": "kirikasama","wamakko":"wamako","nassarawa":"nasarawa","birninmagaji":"birninmagajikiyaw","ileshaeast":"ilesaeast","ileshawest":"ilesawest"}).fillna(df["lga"])
+                lgas["lga_name"] = lgas["lga_name"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
                 df = df.merge(lgas, left_on=["lga", "state_id"], right_on=["lga_name", "state_id"], how="left")
             else:
                 raise Exception("Missing 'lga' or 'state_id' column in data")
@@ -343,17 +435,17 @@ def csm_pipeline():
             
             df = pd.DataFrame(records)
 
-            for col in ["lga_id", "state_id","age","epi_week"]:
+            for col in ["lga_id", "state_id","age","epi_week_calculated", "epi_year"]:
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["epid_number", "disease_id", "date_of_symptom_onset_mm_dd_yyyy", "gender", "age", "lga_id", "state_id","case_classification","admitted_as_inpatient", "source_system", "case_version", "epi_week"]
+            required_cols = ["epid_number", "disease_id", "date_of_symptom_onset_mm_dd_yyyy", "gender", "age", "lga_id", "state_id","case_classification","admitted_as_inpatient", "source_system", "case_version", "epi_week_calculated","epi_year","outcome_of_case"]
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification", "hospitalisation_status", "source_system", "case_version", "epi_week"]
+            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification", "hospitalisation_status", "source_system", "case_version", "epi_week_calculated","epi_year","outcome_of_case"]
             
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
@@ -362,7 +454,7 @@ def csm_pipeline():
             cur.execute("""
             CREATE TEMP TABLE tmp_core_case_fact (
                 epid_number VARCHAR(50), disease_id INT, onset_date DATE, sex VARCHAR(10),
-                age INT, lga_id INT, state_id INT, case_classification VARCHAR(50), hospitalisation_status VARCHAR(50), source_system INT, case_version INT,  epi_week INT
+                age INT, lga_id INT, state_id INT, case_classification VARCHAR(50), hospitalisation_status VARCHAR(50), source_system INT, case_version INT,  epi_week INT, epi_year INT, outcome VARCHAR(50)
             ) ON COMMIT DROP
             """)
             
@@ -371,13 +463,13 @@ def csm_pipeline():
             buffer.seek(0)
 
             cur.copy_expert("""
-            COPY tmp_core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id, state_id, case_classification,hospitalisation_status, source_system,case_version,epi_week)
+            COPY tmp_core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id, state_id, case_classification,hospitalisation_status, source_system,case_version,epi_week, epi_year, outcome)
             FROM STDIN WITH CSV
             """, buffer)
 
             cur.execute("""
-            INSERT INTO core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,hospitalisation_status,source_system,case_version,epi_week)
-            SELECT epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,hospitalisation_status, source_system,case_version,epi_week
+            INSERT INTO core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,hospitalisation_status,source_system,case_version,epi_week, epi_year, outcome)
+            SELECT epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,hospitalisation_status, source_system,case_version,epi_week, epi_year, outcome
             FROM tmp_core_case_fact
             ON CONFLICT (epid_number) DO UPDATE SET 
                         disease_id = EXCLUDED.disease_id, 
@@ -390,7 +482,9 @@ def csm_pipeline():
                         hospitalisation_status = EXCLUDED.hospitalisation_status, 
                         source_system = EXCLUDED.source_system, 
                         case_version = EXCLUDED.case_version,
-                        epi_week = EXCLUDED.epi_week            
+                        epi_week = EXCLUDED.epi_week, 
+                        epi_year = EXCLUDED.epi_year,
+                        outcome = EXCLUDED.outcome           
             RETURNING case_fact_id, epid_number
             """)
 
@@ -492,11 +586,18 @@ def csm_pipeline():
 # facility, case_classification,first_symptom,date_specimen_collected,date_specimen_received_at_lab,date_specimen_tested,sodc,hpd,
                 #lyta,species,nma,nmb,nmc,nmw,nmx,nmy,hib,spn,final_intepretation,
             cur.execute("""
-            INSERT INTO ext_csm_case (case_id, date_of_report,ward,vaccination_status,vaccinated_men5doses,
-                sample_collected,result_interpretation)
-            SELECT case_id, date_of_report,ward,vaccination_status,vaccinated_men5doses,
-                sample_collected,result_interpretation
+            INSERT INTO ext_csm_case (case_id, ward,vaccination_status,vaccinated_men5doses,
+                sample_collected,result_interpretation,date_of_report)
+            SELECT case_id, ward,vaccination_status,vaccinated_men5doses,
+                sample_collected,result_interpretation, date_of_report
             FROM tmp_ext_csm_case
+            ON CONFLICT (case_id) DO UPDATE SET 
+                        date_of_report = EXCLUDED.date_of_report,
+                        ward = EXCLUDED.ward,
+                        vaccination_status = EXCLUDED.vaccination_status,
+                        vaccinated_men5doses = EXCLUDED.vaccinated_men5doses,
+                        sample_collected = EXCLUDED.sample_collected,
+                        result_interpretation = EXCLUDED.result_interpretation
             """)
             
             conn.commit()
@@ -504,7 +605,7 @@ def csm_pipeline():
         except Exception as e:
             if conn:
                 conn.rollback()
-            raise Exception(f"Error in load_lassaFever_extension_table: {str(e)}") from e
+            raise Exception(f"Error in load_csm_extension_table: {str(e)}") from e
         finally:
             if conn:
                 try:

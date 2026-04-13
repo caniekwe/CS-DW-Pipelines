@@ -130,14 +130,19 @@ def cholera_pipeline():
                 df.rename(columns={"epidn0s": "epid_number"}, inplace=True)
 
             df["samplestaken"] = df["samplestaken"].map({"Yes": True, "No": False}).astype("boolean").fillna(pd.NA)
-            df["outcome"] = df["outcome"].map({"Alive":"Alive", "Dead":"Dead"}).fillna("missing")
+            df["outcome"] = df["outcome"].str.strip().str.lower().fillna("missing")
             df["sex"] = df["sex"].map({"M":"male","F":"female"}).fillna("missing")
             df["hospitalised_no"] = df["hospitalised_no"].map({"Outpatient": "outpatient", "Inpatient": "inpatient"}).fillna("missing")
             df["level_of_hydration"] = df["level_of_hydration"].map({"Severe":"severe", "Moderate":"moderate", "Mild":"mild", "Severe dehydration":"severe_dehydration", "High":"high"}).fillna("missing")
             df["age"] = np.ceil(pd.to_numeric(df["age"], errors="coerce")).astype("Int64")
-            df["labresults_rdt"] = df["labresults_rdt"].map({"Positive":"positive", "Negative":"negative","Pending":"pending","Not Done":"not_done"}).fillna(pd.NA)
-            df["labresults_cul"] = df["labresults_cul"].map({"Positive":"positive", "Negative":"negative","Pending":"pending","Not Done":"not_done"}).fillna(pd.NA)
             
+            if "labresults_rdt" in df.columns:
+                df["labresults_rdt"] = df["labresults_rdt"].str.strip().str.lower()
+                df["labresults_rdt"] = df["labresults_rdt"].map({"not done":"not_done"}).fillna(df["labresults_rdt"])
+            if "labresults_cul" in df.columns:
+                df["labresults_cul"] = df["labresults_cul"].str.strip().str.lower()
+                df["labresults_cul"] = df["labresults_cul"].map({"not done":"not_done"}).fillna(df["labresults_cul"])
+
             if "labresults_rdt" in df.columns and "labresults_cul" in df.columns:
                 df["case_classification"] = np.where(
                         (df["labresults_rdt"].str.lower() == "positive") | (df["labresults_cul"].str.lower() == "positive"), "confirmed",
@@ -264,11 +269,17 @@ def cholera_pipeline():
                 raise Exception("No LGAs found in master_lga table")
 
             if "state" in df.columns:
+                df["state"] = df["state"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
+                df["state"] = df["state"].map({"fct": "federalcapitalterritory"}).fillna(df["state"])
+                states["state_name"] = states["state_name"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
                 df = df.merge(states, left_on="state", right_on="state_name", how="left")
             else:
                 raise Exception("Missing 'state' column in data")
 
             if "lga" in df.columns and "state_id" in df.columns:
+                df["lga"] = df["lga"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
+                df["lga"] = df["lga"].map({"yenegoa": "yenagoa","aiyekiregbonyin":"gbonyin","munya":"moya","abujamunicipal":"municipalareacouncil"}).fillna(df["lga"])
+                lgas["lga_name"] = lgas["lga_name"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
                 df = df.merge(lgas, left_on=["lga", "state_id"], right_on=["lga_name", "state_id"], how="left")
             else:
                 raise Exception("Missing 'lga' or 'state_id' column in data")
@@ -512,6 +523,15 @@ def cholera_pipeline():
             SELECT case_id,date_seen_at_hf,samples_taken,labresult_rdt,
                 labresult_cul,level_of_hydration,datasource,tests
             FROM tmp_ext_cholera_case
+            ON CONFLICT (case_id) DO UPDATE
+            SET
+                date_seen_at_hf = EXCLUDED.date_seen_at_hf,
+                samples_taken = EXCLUDED.samples_taken,
+                labresult_rdt = EXCLUDED.labresult_rdt,
+                labresult_cul = EXCLUDED.labresult_cul,
+                level_of_hydration = EXCLUDED.level_of_hydration,
+                datasource = EXCLUDED.datasource,
+                tests = EXCLUDED.tests
             """)
             
             conn.commit()
