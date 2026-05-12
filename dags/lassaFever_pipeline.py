@@ -142,6 +142,10 @@ def lassa_pipeline():
             if age_cols:
                 df["age"] = df[age_cols].bfill(axis=1).iloc[:, 0]
 
+            if "gender" in df.columns:
+                df["gender"] = df["gender"].str.strip().str.lower()
+                df["gender"] = df["gender"].map({"m": "male", "f": "female"}).fillna("missing")
+
             for col in ["date_of_symptom_onset", "date_of_hospitalization"]:
                 if col in df.columns and df[col].dtype == 'object':
                     df[col] = df[col].str.strip()
@@ -180,7 +184,7 @@ def lassa_pipeline():
             dag_run = context["dag_run"]   
             ti = context["task_instance"]     
             rec_no = len(df)
-            valid_rows = []
+            # valid_rows = []
             failures = []
             print(f"Starting validate_data with {rec_no} records")
             
@@ -197,7 +201,8 @@ def lassa_pipeline():
                     elif pd.isna(row.get("epid_number")):
                         failures.append((int(idx),"Missing Epid number",dag_run.run_id, ti.dag_id))
                     else:
-                        valid_rows.append(row)
+                        pass
+                        # valid_rows.append(row)
                 except Exception as row_error:
                     print(f"Row {idx} failed with error: {row_error}")
                     failures.append((int(idx),f"Row processing error: {str(row_error)}",dag_run.run_id, ti.dag_id))
@@ -224,7 +229,7 @@ def lassa_pipeline():
                         except:
                             pass
 
-            df_valid = make_xcom_safe(pd.DataFrame(valid_rows))
+            df_valid = make_xcom_safe(df)
             
             return df_valid.to_dict("records")
             
@@ -279,11 +284,15 @@ def lassa_pipeline():
                 raise Exception("No LGAs found in master_lga table")
 
             if "state" in df.columns:
+                df["state"] = df["state"].str.strip().str.lower()
+                states["state_name"] = states["state_name"].str.strip().str.lower()
                 df = df.merge(states, left_on="state", right_on="state_name", how="left")
             else:
                 raise Exception("Missing 'state' column in data")
 
             if "lga" in df.columns and "state_id" in df.columns:
+                df["lga"] = df["lga"].str.strip().str.lower()
+                lgas["lga_name"] = lgas["lga_name"].str.strip().str.lower()
                 df = df.merge(lgas, left_on=["lga", "state_id"], right_on=["lga_name", "state_id"], how="left")
             else:
                 raise Exception("Missing 'lga' or 'state_id' column in data")
@@ -357,17 +366,17 @@ def lassa_pipeline():
             
             df = pd.DataFrame(records)
 
-            for col in ["lga_id", "state_id"]:
+            for col in ["lga_id", "state_id","age","epi_week","epi_year"]:
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["epid_number", "disease_id", "date_of_symptom_onset", "gender", "age", "lga_id", "state_id","case_classification","date_of_hospitalization", "source_system", "case_version"]
+            required_cols = ["epid_number", "disease_id", "date_of_symptom_onset", "gender", "age", "lga_id", "state_id","case_classification","date_of_hospitalization", "source_system", "case_version","epi_week","epi_year"]
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification","date_of_hospitalization", "source_system", "case_version"]
+            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification","date_of_hospitalization", "source_system", "case_version","epi_week","epi_year"]
             
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
@@ -376,7 +385,7 @@ def lassa_pipeline():
             cur.execute("""
             CREATE TEMP TABLE tmp_core_case_fact (
                 epid_number VARCHAR(50), disease_id INT, onset_date DATE, sex VARCHAR(10),
-                age INT, "lga_id" INT, "state_id" INT, case_classification VARCHAR(50), date_of_hospitalization DATE, source_system INT, case_version INT
+                age INT, "lga_id" INT, "state_id" INT, case_classification VARCHAR(50), date_of_hospitalization DATE, source_system INT, case_version INT,  epi_week INT, epi_year INT
             ) ON COMMIT DROP
             """)
             
@@ -385,15 +394,17 @@ def lassa_pipeline():
             buffer.seek(0)
 
             cur.copy_expert("""
-            COPY tmp_core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id, state_id,case_classification,date_of_hospitalization, source_system,case_version)
+            COPY tmp_core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id, state_id,case_classification,date_of_hospitalization, source_system,case_version,epi_week,epi_year)
             FROM STDIN WITH CSV
             """, buffer)
 
             cur.execute("""
-            INSERT INTO core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,date_of_hospitalization,source_system,case_version)
-            SELECT epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,date_of_hospitalization, source_system,case_version
+            INSERT INTO core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,date_of_hospitalization,source_system,case_version,epi_week,epi_year)
+            SELECT epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,date_of_hospitalization, source_system,case_version,epi_week,epi_year
             FROM tmp_core_case_fact
-            ON CONFLICT (epid_number) DO UPDATE SET disease_id = EXCLUDED.disease_id, onset_date = EXCLUDED.onset_date, sex = EXCLUDED.sex, age = EXCLUDED.age, lga_id = EXCLUDED.lga_id, state_id = EXCLUDED.state_id, case_classification = EXCLUDED.case_classification, date_of_hospitalization = EXCLUDED.date_of_hospitalization, source_system = EXCLUDED.source_system, case_version = EXCLUDED.case_version            
+            ON CONFLICT (epid_number) DO UPDATE SET disease_id = EXCLUDED.disease_id, onset_date = EXCLUDED.onset_date, sex = EXCLUDED.sex, age = EXCLUDED.age, lga_id = EXCLUDED.lga_id, 
+                        state_id = EXCLUDED.state_id, case_classification = EXCLUDED.case_classification, date_of_hospitalization = EXCLUDED.date_of_hospitalization, 
+                        source_system = EXCLUDED.source_system, case_version = EXCLUDED.case_version, epi_week = EXCLUDED.epi_week, epi_year = EXCLUDED.epi_year
             RETURNING case_fact_id, epid_number
             """)
 
