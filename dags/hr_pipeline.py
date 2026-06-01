@@ -415,8 +415,8 @@ def hr_pipeline():
         conn = None
         cur = None
         try:
-            extracted_count = len(records) if records else 0
-            loaded_count = len(loaded_records) if loaded_records else 0
+            extracted_count = len(pd.DataFrame(records)) if not pd.DataFrame(records).empty else 0
+            loaded_count = len(pd.DataFrame(loaded_records)) if not pd.DataFrame(loaded_records).empty else 0
 
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
