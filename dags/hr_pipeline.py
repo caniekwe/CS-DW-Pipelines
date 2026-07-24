@@ -137,9 +137,9 @@ def hr_pipeline():
             if lgas is None or lgas.empty:
                 raise Exception("No LGAs found in master_lga table")
             
-            dept = dw.get_pandas_df("SELECT department_id, department_name FROM master_department")
+            dept = dw.get_pandas_df("SELECT department_id, department_name FROM master_departments")
             if dept is None or dept.empty:
-                raise Exception("No departments found in master_department table")
+                raise Exception("No departments found in master_departments table")
 
             if "state_of_origin" in df.columns:
                 df["state"] = df["state_of_origin"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
@@ -297,18 +297,18 @@ def hr_pipeline():
             
             df = pd.DataFrame(records)
 
-            for col in ["lga_id", "state_id","age","wk","yr"]:
+            for col in ["ippis", "department_id","lga_id","state_id"]:
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["file_no", "ippis", "surname", "firstname", "othername", "rank", "sgl","department","primary_qualification","other_qualification", "date_of_birth", "date_of_1st_appt","date_of_appt_conf","lga_id","state_id","date_of_pp_appt","location","sex","years_in_service","record_version"]
+            required_cols = ["file_no", "ippis", "surname", "firstname", "othername", "rank", "sgl","department_id","primary_qualification","other_qualification", "date_of_birth", "date_of_1st_appt","date_of_appt_conf","lga_id","state_id","date_of_pp_appt","location","sex","years_in_service","record_version","staff_on_leave"]
 
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["file_no", "ippis", "surname", "firstname", "othername", "rank", "sgl","department","primary_qualification","other_qualification", "date_of_birth", "date_of_1st_appt","date_of_appt_conf","lga_id","state_id","date_of_pp_appt","location","sex","years_in_service","record_version"]
+            fact_df.columns = ["file_no", "ippis", "surname", "firstname", "othername", "rank", "sgl","department_id","primary_qualification","other_qualification", "date_of_birth", "date_of_1st_appt","date_of_appt_conf","lga_id","state_id","date_of_pp_appt","location","sex","years_in_service","record_version","staff_on_leave"]
             
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
@@ -335,7 +335,8 @@ def hr_pipeline():
                 location VARCHAR(100),
                 sex VARCHAR(10),
                 years_in_service int,
-                record_version int
+                record_version int,
+                leave_status VARCHAR(50)
             ) ON COMMIT DROP
             """)
             
@@ -348,7 +349,7 @@ def hr_pipeline():
             (file_no,ippis,surname,firstname,othername,
             rank,sgl,department,primary_qualification,other_qualification,
             date_of_birth,date_of_1st_appt,date_of_appt_conf,lga_of_origin,state_of_origin,
-            date_of_pp_appt,location,sex,years_in_service,record_version)
+            date_of_pp_appt,location,sex,years_in_service,record_version, leave_status)
             FROM STDIN WITH CSV
             """, buffer)
 
@@ -357,11 +358,11 @@ def hr_pipeline():
             (file_no,ippis,surname,firstname,othername,
             rank,sgl,department,primary_qualification,other_qualification,
             date_of_birth,date_of_1st_appt,date_of_appt_conf,lga_of_origin,state_of_origin,
-            date_of_pp_appt,location,sex,years_in_service,record_version)
+            date_of_pp_appt,location,sex,years_in_service,record_version, leave_status)
             SELECT file_no,ippis,surname,firstname,othername,
                 rank,sgl,department,primary_qualification,other_qualification,
                 date_of_birth,date_of_1st_appt,date_of_appt_conf,lga_of_origin,state_of_origin,
-                date_of_pp_appt,location,sex,years_in_service,record_version
+                date_of_pp_appt,location,sex,years_in_service,record_version, leave_status
             FROM tmp_core_hr_fact
             ON CONFLICT (file_no) DO UPDATE
             SET
@@ -382,7 +383,8 @@ def hr_pipeline():
                 location = EXCLUDED.location,
                 sex = EXCLUDED.sex,
                 years_in_service = EXCLUDED.years_in_service,
-                record_version = EXCLUDED.record_version
+                record_version = EXCLUDED.record_version,
+                leave_status = EXCLUDED.leave_status
             RETURNING file_no, ippis
             """)
 
