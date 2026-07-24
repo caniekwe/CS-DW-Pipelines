@@ -100,11 +100,7 @@ def cholera_pipeline():
         conn.commit()
 
         return etl_run_id
-
-
-    # -------------------------
-    # Incremental Extract
-    # -------------------------
+ 
     @task
     def extract_data(started, **context):
         BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -165,17 +161,7 @@ def cholera_pipeline():
             df = pd.DataFrame(records)
             df.replace("null", pd.NA, inplace=True)
 
-            # if "epidn0s" in df.columns:
-            #     df.rename(columns={"epidn0s": "epid_number"}, inplace=True)
-
-            # df["samplestaken"] = df["samplestaken"].map({"Yes": True, "No": False}).astype("boolean").fillna(pd.NA)
-            # df["outcome"] = df["outcome"].str.strip().str.lower().fillna("missing")
-            # df["sex"] = df["sex"].map({"M":"male","F":"female"}).fillna("missing")
-            # df["hospitalised_no"] = df["hospitalised_no"].map({"Outpatient": "outpatient", "Inpatient": "inpatient"}).fillna("missing")
-            # df["level_of_hydration"] = df["level_of_hydration"].map({"Severe":"severe", "Moderate":"moderate", "Mild":"mild", "Severe dehydration":"severe_dehydration", "High":"high"}).fillna("missing")
-            # df["age"] = np.ceil(pd.to_numeric(df["age"], errors="coerce")).astype("Int64")
             df.columns = df.columns.str.lower()
-
 
             if "labresults_rdt" in df.columns:
                 df["labresults_rdt"] = df["labresults_rdt"].str.strip().str.lower()
@@ -281,10 +267,6 @@ def cholera_pipeline():
     #         print(f"CRITICAL ERROR in deduplicate: {str(e)}")
     #         raise Exception(f"Error in deduplicate: {str(e)}") from e
 
-
-    # -------------------------
-    # Dimension Resolution
-    # -------------------------
     @task
     def resolve_dimensions(records):
         try:
