@@ -1,3 +1,4 @@
+import os
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.utils.trigger_rule import TriggerRule
@@ -109,15 +110,53 @@ def lassa_pipeline():
     # -------------------------
     @task
     def extract_data(started):
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         try:
             if not started:
                 return []
             staging = PostgresHook(postgres_conn_id=staging_conn_id)
-            sql = "SELECT * FROM lassa_fever_2025"
+            sql = "SELECT stored_path FROM file_uploads WHERE primary_disease ='lassa_fever' AND file_type='disease_line_list' ORDER BY uploaded_at DESC LIMIT 1"
             df = staging.get_pandas_df(sql)
             if df is None or df.empty:
                 return []
-            return df.to_dict("records")
+            else:
+                stored_path = df.iloc[0]["stored_path"]
+                if not stored_path:
+                    return []                
+                
+                hook = PostgresHook(postgres_conn_id=dw_conn_id)
+                conn = hook.get_conn()
+                #check if file has been processed before
+                file_name = os.path.basename(stored_path)
+
+                sql_check = "SELECT count(*) FROM etl_run_log WHERE file_name = %s and status = 'SUCCESS'"
+                check = hook.get_pandas_df(sql_check, parameters= (file_name,))
+                if check is None or check.empty:
+                    return []
+                else:
+                    count = check.iloc[0][0]
+                    if count > 0:
+                        return []
+                    else:
+                        full_path = os.path.join(BASE_DIR, stored_path)
+                        root, file_ext = os.path.splitext(file_name)
+                        if file_ext == '.csv':
+                            line_list_data = pd.read_csv(full_path)
+                        elif file_ext in ['.xlsx', '.xls']:
+                            line_list_data = pd.read_excel(full_path)
+                        
+                        if line_list_data is None or line_list_data.empty:
+                            return []
+                        else:
+                            cur = conn.cursor()
+                            cur.execute("""
+                                    UPDATE etl_run_log
+                                    SET file_name = %s        
+                                    WHERE run_id=%s
+                                """, (file_name, started))
+                            
+                            conn.commit()
+                            return make_xcom_safe(line_list_data).to_dict("records")
         except Exception as e:
             raise Exception(f"Error in extract data from the staging db: {str(e)}") from e
 
@@ -128,34 +167,34 @@ def lassa_pipeline():
                 return []
             df = pd.DataFrame(records)
             df.replace("null", pd.NA, inplace=True)
-            if "caseid" in df.columns:
-                df.rename(columns={"caseid": "epid_number"}, inplace=True)
+            # if "caseid" in df.columns:
+            #     df.rename(columns={"caseid": "epid_number"}, inplace=True)
 
-            if "age_years" in df.columns:
-                df["age_years"] = np.ceil(pd.to_numeric(df["age_years"], errors="coerce")).astype("Int64")
-            if "age_months" in df.columns:
-                df["age_months"] = np.ceil(pd.to_numeric(df["age_months"], errors="coerce")/12).astype("Int64")
-            if "age_days" in df.columns:
-                df["age_days"] = np.ceil(pd.to_numeric(df["age_days"], errors="coerce")/365).astype("Int64")
+            # if "age_years" in df.columns:
+            #     df["age_years"] = np.ceil(pd.to_numeric(df["age_years"], errors="coerce")).astype("Int64")
+            # if "age_months" in df.columns:
+            #     df["age_months"] = np.ceil(pd.to_numeric(df["age_months"], errors="coerce")/12).astype("Int64")
+            # if "age_days" in df.columns:
+            #     df["age_days"] = np.ceil(pd.to_numeric(df["age_days"], errors="coerce")/365).astype("Int64")
             
-            age_cols = [c for c in ["age_years", "age_months", "age_days"] if c in df.columns]
-            if age_cols:
-                df["age"] = df[age_cols].bfill(axis=1).iloc[:, 0]
+            # age_cols = [c for c in ["age_years", "age_months", "age_days"] if c in df.columns]
+            # if age_cols:
+            #     df["age"] = df[age_cols].bfill(axis=1).iloc[:, 0]
 
-            if "gender" in df.columns:
-                df["gender"] = df["gender"].str.strip().str.lower()
-                df["gender"] = df["gender"].map({"m": "male", "f": "female"}).fillna("missing")
+            # if "gender" in df.columns:
+            #     df["gender"] = df["gender"].str.strip().str.lower()
+            #     df["gender"] = df["gender"].map({"m": "male", "f": "female"}).fillna("missing")
 
-            for col in ["date_of_symptom_onset", "date_of_hospitalization"]:
-                if col in df.columns and df[col].dtype == 'object':
-                    df[col] = df[col].str.strip()
+            # for col in ["date_of_symptom_onset"]:
+            #     if col in df.columns and df[col].dtype == 'object':
+            #         df[col] = df[col].str.strip()
             
-            if "specimen_type" in df.columns:
-                df["specimen_type"] = df["specimen_type"].map({"Blood": "blood","Urine": "urine","Plasma": "plasma","Serum": "serum","Other":"other"}).fillna("missing")
+            # if "specimen_type" in df.columns:
+            #     df["specimen_type"] = df["specimen_type"].map({"Blood": "blood","Urine": "urine","Plasma": "plasma","Serum": "serum","Other":"other"}).fillna("missing")
             
-            for col in ["ct_value_qrt_pcr_i_target", "ct_value_qrt_pcr_ii_target"]:
-                if col in df.columns:
-                    df[col] = df[col].fillna("missing")
+            # for col in ["ct_value_qrt_pcr_i_target", "ct_value_qrt_pcr_ii_target"]:
+            #     if col in df.columns:
+            #         df[col] = df[col].fillna("missing")
             
             if "result_intepretation_positive_negative_or_rejected" in df.columns:
                 df["result_intepretation_positive_negative_or_rejected"] = df["result_intepretation_positive_negative_or_rejected"].map({"Positive": "positive", "Negative": "negative"}).fillna("missing")
@@ -163,9 +202,9 @@ def lassa_pipeline():
                 df["case_classification"] = np.where(df["result_intepretation_positive_negative_or_rejected"] == "positive", "confirmed",
                                             np.where(df["result_intepretation_positive_negative_or_rejected"].isna(), "missing", "suspected"))
 
-            for col in ["date_of_specimen_collection", "date_specimen_received_at_lab", "date_specimen_tested"]:
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors="coerce").dt.date.where(pd.to_datetime(df[col], errors="coerce").notna(), None)
+            # for col in ["date_of_specimen_collection", "date_specimen_received_at_lab", "date_specimen_tested"]:
+            #     if col in df.columns:
+            #         df[col] = pd.to_datetime(df[col], errors="coerce").dt.date.where(pd.to_datetime(df[col], errors="coerce").notna(), None)
 
             return df.to_dict("records")
         except Exception as e:
@@ -173,93 +212,93 @@ def lassa_pipeline():
     # -------------------------
     # Validation
     # -------------------------
-    @task
-    def validate_data(records, **context):
-        conn = None
-        try:
-            if not records:
-                return []
+    # @task
+    # def validate_data(records, **context):
+    #     conn = None
+    #     try:
+    #         if not records:
+    #             return []
             
-            df = pd.DataFrame(records)
-            dag_run = context["dag_run"]   
-            ti = context["task_instance"]     
-            rec_no = len(df)
-            # valid_rows = []
-            failures = []
-            print(f"Starting validate_data with {rec_no} records")
+    #         df = pd.DataFrame(records)
+    #         dag_run = context["dag_run"]   
+    #         ti = context["task_instance"]     
+    #         rec_no = len(df)
+    #         # valid_rows = []
+    #         failures = []
+    #         print(f"Starting validate_data with {rec_no} records")
             
-            for idx, row in df.iterrows():
-                try:
-                    age = pd.to_numeric(row.get("age"), errors="coerce")
+    #         for idx, row in df.iterrows():
+    #             try:
+    #                 age = pd.to_numeric(row.get("age"), errors="coerce")
 
-                    if pd.isna(row.get("state")) and pd.isna(row.get("lga")):
-                        failures.append((int(idx),"Missing location",dag_run.run_id, ti.dag_id))
+    #                 if pd.isna(row.get("state")) and pd.isna(row.get("lga")):
+    #                     failures.append((int(idx),"Missing location",dag_run.run_id, ti.dag_id))
 
-                    elif pd.isna(age) or age < 0 or age > 120: 
-                        failures.append((int(idx),"Invalid age",dag_run.run_id, ti.dag_id))
+    #                 elif pd.isna(age) or age < 0 or age > 120: 
+    #                     failures.append((int(idx),"Invalid age",dag_run.run_id, ti.dag_id))
 
-                    elif pd.isna(row.get("epid_number")):
-                        failures.append((int(idx),"Missing Epid number",dag_run.run_id, ti.dag_id))
-                    else:
-                        pass
-                        # valid_rows.append(row)
-                except Exception as row_error:
-                    print(f"Row {idx} failed with error: {row_error}")
-                    failures.append((int(idx),f"Row processing error: {str(row_error)}",dag_run.run_id, ti.dag_id))
-            if failures:
-                try:
-                    hook = PostgresHook(postgres_conn_id=dw_conn_id)
-                    conn = hook.get_conn()
-                    cur = conn.cursor()
-                    cur.executemany("""
-                    INSERT INTO etl_validation_failures
-                    (row_number,failure_reason, run_id, dag_id)
-                    VALUES (%s,%s,%s,%s)
-                    """, failures)
-                    conn.commit()
-                except Exception as db_error:
-                    print(f"DB Error inserting validation failures: {str(db_error)}")
-                    if conn:
-                        conn.rollback()
-                    raise Exception(f"Error inserting validation failures: {str(db_error)}") from db_error
-                finally:
-                    if conn:
-                        try:
-                            conn.close()
-                        except:
-                            pass
+    #                 elif pd.isna(row.get("epid_number")):
+    #                     failures.append((int(idx),"Missing Epid number",dag_run.run_id, ti.dag_id))
+    #                 else:
+    #                     pass
+    #                     # valid_rows.append(row)
+    #             except Exception as row_error:
+    #                 print(f"Row {idx} failed with error: {row_error}")
+    #                 failures.append((int(idx),f"Row processing error: {str(row_error)}",dag_run.run_id, ti.dag_id))
+    #         if failures:
+    #             try:
+    #                 hook = PostgresHook(postgres_conn_id=dw_conn_id)
+    #                 conn = hook.get_conn()
+    #                 cur = conn.cursor()
+    #                 cur.executemany("""
+    #                 INSERT INTO etl_validation_failures
+    #                 (row_number,failure_reason, run_id, dag_id)
+    #                 VALUES (%s,%s,%s,%s)
+    #                 """, failures)
+    #                 conn.commit()
+    #             except Exception as db_error:
+    #                 print(f"DB Error inserting validation failures: {str(db_error)}")
+    #                 if conn:
+    #                     conn.rollback()
+    #                 raise Exception(f"Error inserting validation failures: {str(db_error)}") from db_error
+    #             finally:
+    #                 if conn:
+    #                     try:
+    #                         conn.close()
+    #                     except:
+    #                         pass
 
-            df_valid = make_xcom_safe(df)
+    #         df_valid = make_xcom_safe(df)
             
-            return df_valid.to_dict("records")
+    #         return df_valid.to_dict("records")
             
             
-        except Exception as e:
-            print(f"CRITICAL ERROR in validate_data: {str(e)}")
-            raise Exception(f"Error in validate_data: {str(e)}") from e
+    #     except Exception as e:
+    #         print(f"CRITICAL ERROR in validate_data: {str(e)}")
+    #         raise Exception(f"Error in validate_data: {str(e)}") from e
 
 
-    # -------------------------
-    # Deduplication
-    # -------------------------
-    @task
-    def deduplicate(records):
-        try:
-            if not records:
-                print("WARNING: deduplicate received empty list, returning empty")
-                return []
+    # # -------------------------
+    # # Deduplication
+    # # -------------------------
+    # @task
+    # def deduplicate(records):
+    #     try:
+    #         if not records:
+    #             print("WARNING: deduplicate received empty list, returning empty")
+    #             return []
             
-            df = pd.DataFrame(records)
+    #         df = pd.DataFrame(records)
             
-            if "epid_number" in df.columns:
-                df = df.drop_duplicates(subset=["epid_number"])
-            else:
-                df = df.drop_duplicates()
+    #         if "epid_number" in df.columns:
+    #             df = df.drop_duplicates(subset=["epid_number"])
+    #         else:
+    #             df = df.drop_duplicates()
 
-            return make_xcom_safe(df).to_dict("records")
-        except Exception as e:
-            print(f"CRITICAL ERROR in deduplicate: {str(e)}")
-            raise Exception(f"Error in deduplicate: {str(e)}") from e
+    #         return make_xcom_safe(df).to_dict("records")
+    #     except Exception as e:
+    #         print(f"CRITICAL ERROR in deduplicate: {str(e)}")
+    #         raise Exception(f"Error in deduplicate: {str(e)}") from e
 
 
     # -------------------------
@@ -301,12 +340,12 @@ def lassa_pipeline():
             if disease is None or disease.empty:
                 raise Exception("No disease found with name 'Lassa fever'")
 
-            source = dw.get_pandas_df("SELECT system_id FROM master_source_systems WHERE system_name='disease line list'")
-            if source is None or source.empty:
-                raise Exception("No source system found with name 'disease line list'")
+            # source = dw.get_pandas_df("SELECT system_id FROM master_source_systems WHERE system_name='disease line list'")
+            # if source is None or source.empty:
+            #     raise Exception("No source system found with name 'disease line list'")
 
             df["disease_id"] = disease.iloc[0]["disease_id"]
-            df["source_system"] = source.iloc[0]["system_id"]
+            # df["source_system"] = source.iloc[0]["system_id"]
             for col in ["lga_id", "state_id"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
@@ -320,106 +359,132 @@ def lassa_pipeline():
 
     # -------------------------
     # Case Versioning
-    # -------------------------
-    @task
-    def apply_case_versioning(records):
-        try:
-            if not records:
-                print("WARNING: apply_case_versioning received empty list, returning empty")
-                return []
+    # # -------------------------
+    # @task
+    # def apply_case_versioning(records):
+    #     try:
+    #         if not records:
+    #             print("WARNING: apply_case_versioning received empty list, returning empty")
+    #             return []
             
-            df = pd.DataFrame(records)
-            dw = PostgresHook(postgres_conn_id=dw_conn_id)
+    #         df = pd.DataFrame(records)
+    #         dw = PostgresHook(postgres_conn_id=dw_conn_id)
 
-            try:
-                existing = dw.get_pandas_df("SELECT epid_number, MAX(case_version) AS version FROM core_case_fact GROUP BY epid_number")
-            except Exception as query_error:
-                print(f"Warning: Could not query existing case versions: {str(query_error)}")
-                existing = None
+    #         try:
+    #             existing = dw.get_pandas_df("SELECT epid_number, MAX(case_version) AS version FROM core_case_fact GROUP BY epid_number")
+    #         except Exception as query_error:
+    #             print(f"Warning: Could not query existing case versions: {str(query_error)}")
+    #             existing = None
             
-            if existing is None or existing.empty:
-                existing = pd.DataFrame(columns=["epid_number", "version"])
+    #         if existing is None or existing.empty:
+    #             existing = pd.DataFrame(columns=["epid_number", "version"])
             
-            if "epid_number" in df.columns:
-                df = df.merge(existing, on="epid_number", how="left")
+    #         if "epid_number" in df.columns:
+    #             df = df.merge(existing, on="epid_number", how="left")
             
-            df["case_version"] = df["version"].fillna(0) + 1
-            df = df.convert_dtypes()
-            df = df.where(pd.notnull(df), None)
+    #         df["case_version"] = df["version"].fillna(0) + 1
+    #         df = df.convert_dtypes()
+    #         df = df.where(pd.notnull(df), None)
 
-            return make_xcom_safe(df).to_dict("records")
-        except Exception as e:
-            print(f"CRITICAL ERROR in apply_case_versioning: {str(e)}")
-            raise Exception(f"Error in apply_case_versioning: {str(e)}") from e
+    #         return make_xcom_safe(df).to_dict("records")
+    #     except Exception as e:
+    #         print(f"CRITICAL ERROR in apply_case_versioning: {str(e)}")
+    #         raise Exception(f"Error in apply_case_versioning: {str(e)}") from e
 
-    # -------------------------
+    # # -------------------------
     # Bulk Load
     # -------------------------
     @task
-    def load_core_fact_table(records):
+    def load_lassa_fever_data(records):
         conn = None
         cur = None
         try:
             if not records:
-                print("WARNING: load_core_fact_table received empty list, returning empty DataFrame")
-                return pd.DataFrame(columns=["case_fact_id", "epid_number"])
+                print("WARNING: load_lassa_fever_data received empty list, returning empty DataFrame")
+                return []
             
             df = pd.DataFrame(records)
 
-            for col in ["lga_id", "state_id","age","epi_week","epi_year"]:
+            for col in ["lga_id", "state_id","epi_week","epi_year"]:
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["epid_number", "disease_id", "date_of_symptom_onset", "gender", "age", "lga_id", "state_id","case_classification","date_of_hospitalization", "source_system", "case_version","epi_week","epi_year"]
+            required_cols = ["disease_id", "lga_id", "state_id","case_classification","epi_week","epi_year"]
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification","date_of_hospitalization", "source_system", "case_version","epi_week","epi_year"]
+            fact_df.columns = ["disease_id", "lga_id", "state_id", "case_classification","epi_week","epi_year"]
             
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
             cur = conn.cursor()
 
             cur.execute("""
-            CREATE TEMP TABLE tmp_core_case_fact (
-                epid_number VARCHAR(50), disease_id INT, onset_date DATE, sex VARCHAR(10),
-                age INT, "lga_id" INT, "state_id" INT, case_classification VARCHAR(50), date_of_hospitalization DATE, source_system INT, case_version INT,  epi_week INT, epi_year INT
-            ) ON COMMIT DROP
-            """)
-            
+                        CREATE TEMP TABLE tmp_core_surveillance_fact (
+                            disease_id INT,
+                            lga_id INT, 
+                            state_id INT,
+                            case_classification VARCHAR(50),
+                            epi_week INT,
+                            epi_year INT
+                        ) ON COMMIT DROP
+                        """)
+                        
             buffer = io.StringIO()
             fact_df.to_csv(buffer, index=False, header=False)
             buffer.seek(0)
 
             cur.copy_expert("""
-            COPY tmp_core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id, state_id,case_classification,date_of_hospitalization, source_system,case_version,epi_week,epi_year)
+            COPY tmp_core_surveillance_fact
+            (disease_id,lga_id,state_id,case_classification,epi_week,epi_year)
             FROM STDIN WITH CSV
             """, buffer)
 
             cur.execute("""
-            INSERT INTO core_case_fact (epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,date_of_hospitalization,source_system,case_version,epi_week,epi_year)
-            SELECT epid_number,disease_id,onset_date,sex,age,lga_id,state_id,case_classification,date_of_hospitalization, source_system,case_version,epi_week,epi_year
-            FROM tmp_core_case_fact
-            ON CONFLICT (epid_number) DO UPDATE SET disease_id = EXCLUDED.disease_id, onset_date = EXCLUDED.onset_date, sex = EXCLUDED.sex, age = EXCLUDED.age, lga_id = EXCLUDED.lga_id, 
-                        state_id = EXCLUDED.state_id, case_classification = EXCLUDED.case_classification, date_of_hospitalization = EXCLUDED.date_of_hospitalization, 
-                        source_system = EXCLUDED.source_system, case_version = EXCLUDED.case_version, epi_week = EXCLUDED.epi_week, epi_year = EXCLUDED.epi_year
-            RETURNING case_fact_id, epid_number
-            """)
-
-            inserted_rows = cur.fetchall()
-            if not inserted_rows:
-                raise Exception("No rows inserted into core_case_fact table")
-            
+                INSERT INTO core_surveillance_fact (
+                    disease,epi_year,epi_week,state,lga,suspected,confirmed,deaths
+                )
+                SELECT
+                    d.disease_name AS disease,
+                    c.epi_year,
+                    c.epi_week,
+                    s.state_name AS state,
+                    l.lga_name AS lga,
+                    COUNT(*) AS suspected,
+                    SUM(
+                        CASE 
+                            WHEN LOWER(c.case_classification) = 'confirmed' THEN 1 
+                            ELSE 0 
+                        END
+                    ) AS confirmed,
+                    '' AS deaths
+                FROM tmp_core_surveillance_fact c
+                JOIN master_disease d ON c.disease_id = d.disease_id
+                LEFT JOIN master_state s ON c.state_id = s.state_id
+                LEFT JOIN master_lga l ON c.lga_id = l.lga_id
+                WHERE c.onset_date IS NOT NULL
+                GROUP BY
+                    d.disease_name,
+                    c.epi_year,
+                    c.epi_week,
+                    s.state_name,
+                    l.lga_id
+                ON CONFLICT (disease, epi_year, epi_week, state, lga)
+                DO UPDATE SET
+                    suspected = EXCLUDED.suspected,
+                    confirmed = EXCLUDED.confirmed,
+                    deaths = EXCLUDED.deaths;
+                """
+            )
             conn.commit()
-            inserted_df = make_xcom_safe(pd.DataFrame(inserted_rows, columns=["case_fact_id", "epid_number"]))
-            return inserted_df.to_dict("records")
+            cur.close()
+            conn.close()
+            return True
         except Exception as e:
-            print(f"CRITICAL ERROR in load_core_fact_table: {str(e)}")
-            if conn:
-                conn.rollback()
-            raise Exception(f"Error in load_core_fact_table: {str(e)}") from e
+            raise Exception(f"Error in aggregating lassa fever surveillance data from the staging data: {str(e)}") from e
+
         finally:
             if conn:
                 try:
@@ -428,95 +493,94 @@ def lassa_pipeline():
                     conn.close()
                 except:
                     pass
+    # @task
+    # def load_lassaFever_extension_table(records, inserted_cases_df):
+    #     conn = None
+    #     cur = None
+    #     try:
+    #         if not inserted_cases_df:
+    #             return 0
+            
+    #         df = pd.DataFrame(records)
+    #         inserted_cases = pd.DataFrame(inserted_cases_df)
+            
+    #         if "epid_number" not in df.columns or "epid_number" not in inserted_cases.columns:
+    #             raise Exception("Missing epid_number column for merge")
+            
+    #         df = df.merge(inserted_cases, on="epid_number", how="inner")
+            
+    #         if df.empty:
+    #             raise Exception("No matching records after merge with inserted cases")
+            
+    #         required_lassa_cols = [
+    #             "case_fact_id", "epi", "serial", "laboratory", "laboratory_assigned_specimen_id", "village_town",
+    #             "facility_referred_from", "specimen_type", "initial_repeat_follow_up_sample", "date_of_specimen_collection",
+    #             "tranex_courier_yes_no", "way_bill_number_of_the_package_containing_the_sample_if_yes",
+    #             "weight_of_the_package_containing_the_sample_in_kilogram_if_yes", "date_specimen_received_at_lab", "date_specimen_tested",
+    #             "ct_value_qrt_pcr_i_target", "ct_value_qrt_pcr_ii_target", "result_intepretation_positive_negative_or_rejected", "comments",
+    #             "malaria_result_positive_negative_not_done_not_applicable", "other_tests_done_list"
+    #         ]
+            
+    #         available_cols = [col for col in required_lassa_cols if col in df.columns]
+    #         if not available_cols:
+    #             raise Exception(f"None of the required columns found in data")
+            
+    #         lassa_df = df[available_cols].copy()
+            
+    #         hook = PostgresHook(postgres_conn_id=dw_conn_id)
+    #         conn = hook.get_conn()
+    #         cur = conn.cursor()
 
-    @task
-    def load_lassaFever_extension_table(records, inserted_cases_df):
-        conn = None
-        cur = None
-        try:
-            if not inserted_cases_df:
-                return 0
-            
-            df = pd.DataFrame(records)
-            inserted_cases = pd.DataFrame(inserted_cases_df)
-            
-            if "epid_number" not in df.columns or "epid_number" not in inserted_cases.columns:
-                raise Exception("Missing epid_number column for merge")
-            
-            df = df.merge(inserted_cases, on="epid_number", how="inner")
-            
-            if df.empty:
-                raise Exception("No matching records after merge with inserted cases")
-            
-            required_lassa_cols = [
-                "case_fact_id", "epi", "serial", "laboratory", "laboratory_assigned_specimen_id", "village_town",
-                "facility_referred_from", "specimen_type", "initial_repeat_follow_up_sample", "date_of_specimen_collection",
-                "tranex_courier_yes_no", "way_bill_number_of_the_package_containing_the_sample_if_yes",
-                "weight_of_the_package_containing_the_sample_in_kilogram_if_yes", "date_specimen_received_at_lab", "date_specimen_tested",
-                "ct_value_qrt_pcr_i_target", "ct_value_qrt_pcr_ii_target", "result_intepretation_positive_negative_or_rejected", "comments",
-                "malaria_result_positive_negative_not_done_not_applicable", "other_tests_done_list"
-            ]
-            
-            available_cols = [col for col in required_lassa_cols if col in df.columns]
-            if not available_cols:
-                raise Exception(f"None of the required columns found in data")
-            
-            lassa_df = df[available_cols].copy()
-            
-            hook = PostgresHook(postgres_conn_id=dw_conn_id)
-            conn = hook.get_conn()
-            cur = conn.cursor()
+    #         buffer = io.StringIO()
+    #         lassa_df.to_csv(buffer, index=False, header=False)
+    #         buffer.seek(0)
 
-            buffer = io.StringIO()
-            lassa_df.to_csv(buffer, index=False, header=False)
-            buffer.seek(0)
+    #         cur.execute("""
+    #         CREATE TEMP TABLE tmp_ext_lassa_case (
+    #             case_id INT, case_identifier VARCHAR (50), serial_number VARCHAR (50), laboratory VARCHAR (100),
+    #             lab_assigned_id VARCHAR (50), village_town VARCHAR (100), facility_referred_from VARCHAR (100),
+    #             sample_type VARCHAR (50), initial_repeat_followup VARCHAR (50), date_specimen_collection date,
+    #             tranex_courier boolean, waybill_number VARCHAR (100), package_weight_kg VARCHAR (20),
+    #             date_specimen_received date, date_specimen_tested date, ct_value_qrt_pcr_i VARCHAR (50),
+    #             ct_value_qrt_pcr_ii VARCHAR (50), result_interpretation VARCHAR (20), comments VARCHAR(100),
+    #             malaria_result VARCHAR (20), other_tests_done VARCHAR(100)
+    #         ) ON COMMIT DROP
+    #         """)
 
-            cur.execute("""
-            CREATE TEMP TABLE tmp_ext_lassa_case (
-                case_id INT, case_identifier VARCHAR (50), serial_number VARCHAR (50), laboratory VARCHAR (100),
-                lab_assigned_id VARCHAR (50), village_town VARCHAR (100), facility_referred_from VARCHAR (100),
-                sample_type VARCHAR (50), initial_repeat_followup VARCHAR (50), date_specimen_collection date,
-                tranex_courier boolean, waybill_number VARCHAR (100), package_weight_kg VARCHAR (20),
-                date_specimen_received date, date_specimen_tested date, ct_value_qrt_pcr_i VARCHAR (50),
-                ct_value_qrt_pcr_ii VARCHAR (50), result_interpretation VARCHAR (20), comments VARCHAR(100),
-                malaria_result VARCHAR (20), other_tests_done VARCHAR(100)
-            ) ON COMMIT DROP
-            """)
+    #         cur.copy_expert("""
+    #         COPY tmp_ext_lassa_case (case_id,case_identifier, serial_number, laboratory, lab_assigned_id,
+    #         village_town,facility_referred_from,sample_type,initial_repeat_followup, date_specimen_collection,tranex_courier,waybill_number,
+    #         package_weight_kg,date_specimen_received,date_specimen_tested, ct_value_qrt_pcr_i,ct_value_qrt_pcr_ii,result_interpretation,
+    #         comments,malaria_result,other_tests_done)
+    #         FROM STDIN WITH CSV
+    #         """, buffer)
 
-            cur.copy_expert("""
-            COPY tmp_ext_lassa_case (case_id,case_identifier, serial_number, laboratory, lab_assigned_id,
-            village_town,facility_referred_from,sample_type,initial_repeat_followup, date_specimen_collection,tranex_courier,waybill_number,
-            package_weight_kg,date_specimen_received,date_specimen_tested, ct_value_qrt_pcr_i,ct_value_qrt_pcr_ii,result_interpretation,
-            comments,malaria_result,other_tests_done)
-            FROM STDIN WITH CSV
-            """, buffer)
-
-            cur.execute("""
-            INSERT INTO ext_lassa_case (case_id,case_identifier, serial_number, laboratory, lab_assigned_id,
-            village_town,facility_referred_from,sample_type,initial_repeat_followup, date_specimen_collection,tranex_courier,waybill_number,
-            package_weight_kg,date_specimen_received,date_specimen_tested, ct_value_qrt_pcr_i,ct_value_qrt_pcr_ii,result_interpretation,
-            comments,malaria_result,other_tests_done)
-            SELECT case_id,case_identifier, serial_number, laboratory, lab_assigned_id,
-                village_town,facility_referred_from,sample_type,initial_repeat_followup, date_specimen_collection,tranex_courier,waybill_number,
-                package_weight_kg,date_specimen_received,date_specimen_tested, ct_value_qrt_pcr_i,ct_value_qrt_pcr_ii,result_interpretation,
-                comments,malaria_result,other_tests_done
-            FROM tmp_ext_lassa_case
-            """)
+    #         cur.execute("""
+    #         INSERT INTO ext_lassa_case (case_id,case_identifier, serial_number, laboratory, lab_assigned_id,
+    #         village_town,facility_referred_from,sample_type,initial_repeat_followup, date_specimen_collection,tranex_courier,waybill_number,
+    #         package_weight_kg,date_specimen_received,date_specimen_tested, ct_value_qrt_pcr_i,ct_value_qrt_pcr_ii,result_interpretation,
+    #         comments,malaria_result,other_tests_done)
+    #         SELECT case_id,case_identifier, serial_number, laboratory, lab_assigned_id,
+    #             village_town,facility_referred_from,sample_type,initial_repeat_followup, date_specimen_collection,tranex_courier,waybill_number,
+    #             package_weight_kg,date_specimen_received,date_specimen_tested, ct_value_qrt_pcr_i,ct_value_qrt_pcr_ii,result_interpretation,
+    #             comments,malaria_result,other_tests_done
+    #         FROM tmp_ext_lassa_case
+    #         """)
             
-            conn.commit()
-            return len(inserted_cases)
-        except Exception as e:
-            if conn:
-                conn.rollback()
-            raise Exception(f"Error in load_lassaFever_extension_table: {str(e)}") from e
-        finally:
-            if conn:
-                try:
-                    if cur:
-                        cur.close()
-                    conn.close()
-                except:
-                    pass
+    #         conn.commit()
+    #         return len(inserted_cases)
+    #     except Exception as e:
+    #         if conn:
+    #             conn.rollback()
+    #         raise Exception(f"Error in load_lassaFever_extension_table: {str(e)}") from e
+    #     finally:
+    #         if conn:
+    #             try:
+    #                 if cur:
+    #                     cur.close()
+    #                 conn.close()
+    #             except:
+    #                 pass
 
     # -------------------------
     # Run Logging - End
@@ -527,37 +591,36 @@ def lassa_pipeline():
         cur = None
         try:
             extracted_count = len(records) if records else 0
-            loaded_count = loaded_cases if loaded_cases else 0
+            if loaded_cases:
 
-            hook = PostgresHook(postgres_conn_id=dw_conn_id)
-            conn = hook.get_conn()
-            cur = conn.cursor()
+                hook = PostgresHook(postgres_conn_id=dw_conn_id)
+                conn = hook.get_conn()
+                cur = conn.cursor()
 
-            try:
-                cur.execute("""
-                    SELECT COUNT(*)
-                    FROM etl_task_failures
-                    WHERE run_id = %s
-                """, (context.get("run_id", etl_run_id),))
+                try:
+                    cur.execute("""
+                        SELECT COUNT(*)
+                        FROM etl_task_failures
+                        WHERE run_id = %s
+                    """, (context.get("run_id", etl_run_id),))
+                    
+                    result = cur.fetchone()
+                    failure_count = result[0] if result else 0
+                except Exception as query_error:
+                    print(f"Warning: Could not query task failures: {str(query_error)}")
+                    failure_count = 0
+
+                status = "FAILED" if failure_count > 0 else "SUCCESS"
                 
-                result = cur.fetchone()
-                failure_count = result[0] if result else 0
-            except Exception as query_error:
-                print(f"Warning: Could not query task failures: {str(query_error)}")
-                failure_count = 0
+                cur.execute("""
+                    UPDATE etl_run_log
+                    SET end_time = NOW(),
+                        status=%s,
+                        records_extracted = %s          
+                    WHERE run_id=%s
+                """, (status, extracted_count, etl_run_id))
 
-            status = "FAILED" if failure_count > 0 else "SUCCESS"
-            
-            cur.execute("""
-                UPDATE etl_run_log
-                SET end_time = NOW(),
-                    status=%s,
-                    records_extracted = %s,
-                    records_loaded = %s           
-                WHERE run_id=%s
-            """, (status, extracted_count, loaded_count, etl_run_id))
-
-            conn.commit()
+                conn.commit()
         except Exception as e:
             if conn:
                 conn.rollback()
@@ -580,19 +643,17 @@ def lassa_pipeline():
 
     cleaned = clean_data(records)
 
-    validated = validate_data(cleaned)
+    # validated = validate_data(cleaned)
 
-    deduped = deduplicate(validated)
+    # deduped = deduplicate(validated)
 
-    resolved = resolve_dimensions(deduped)
+    resolved = resolve_dimensions(cleaned)
 
-    versioned = apply_case_versioning(resolved)
+    # versioned = apply_case_versioning(resolved)
 
-    case_fact = load_core_fact_table(versioned)
+    loaded_data = load_lassa_fever_data(resolved)
 
-    lassa_extension =load_lassaFever_extension_table(versioned, case_fact)
-
-    end_run(records, lassa_extension, run )
+    end_run(records, loaded_data, run )
 
 
 lassa_pipeline()

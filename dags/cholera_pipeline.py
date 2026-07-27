@@ -653,7 +653,14 @@ def cholera_pipeline():
         except Exception as e:
             raise Exception(f"Error in aggregating cholera surveillance data from the data warehouse: {str(e)}") from e
 
-
+        finally:
+            if conn:
+                try:
+                    if cur:
+                        cur.close()
+                    conn.close()
+                except:
+                    pass
 
     # # -------------------------
     # Run Logging - End
