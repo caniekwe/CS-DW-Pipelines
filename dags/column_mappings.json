@@ -1,0 +1,80 @@
+{
+    "onset_date": [
+        "date of disease onset",
+        "disease onset date",
+        "onset date",
+        "date of onset",
+        "symptom onset date",
+        "date symptoms started",
+        "date of symptom onset",
+        "date symptom started",
+        "date symptoms began",
+        "illness onset date"
+    ],
+    "report_date": [
+        "report date",
+        "date of report",
+        "reporting date",
+        "date reported",
+        "notification date",
+        "date of notification"
+    ],
+    "epi_week": [
+        "epi week",
+        "epidemiological week",
+        "epid week",
+        "week",
+        "Week num",
+        "reporting week"
+    ],
+    "epi_year": [
+        "epi year",
+        "epidemiological year",
+        "epid year",
+        "year",
+        "reporting year"
+    ],
+    "state": [
+        "state",
+        "state name",
+        "residence state",
+        "state of residence",
+        "state of resident",
+        "ProvinceOfResidence"
+    ],
+    "lga": [
+        "lga",
+        "local government area",
+        "local government",
+        "local govt area",
+        "residence lga",
+        "lga of residence",
+        "ReportingDistrict"
+    ],
+    "outcome": [
+        "outcome",
+        "case outcome",
+        "patient outcome",
+        "final outcome"
+    ],
+    "result": [
+        "sars cov 2",
+        "sars-cov-2",
+        "sars_cov_2",
+        "covid19 result",
+        "covid-19 result",
+        "covid result",
+        "lab result",
+        "pcr result",
+        "test result",
+        "result intepretation positive negative or rejected",
+        "result intepretation",
+        "IgM result"
+    ],
+    "case_classification": [
+        "case classification",
+        "classification",
+        "case status",
+        "final classification"
+    ]
+}

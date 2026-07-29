@@ -8,7 +8,8 @@ import numpy as np
 import io
 import re
 import os
-
+import json
+from difflib import SequenceMatcher
 
 # def clean_date_columns(df, date_cols, return_report=True):
 
@@ -131,6 +132,116 @@ def make_xcom_safe(df):
 
     return df
 
+DAG_DIR = os.path.dirname(os.path.abspath(__file__))
+COLUMN_MAPPING_FILE = os.path.join(DAG_DIR, "column_mappings.json")
+
+
+def normalize_column_name(col_name):
+    if col_name is None:
+        return ""
+
+    col_name = str(col_name).lower().strip()
+    col_name = col_name.replace("_", " ")
+    col_name = col_name.replace("-", " ")
+    col_name = re.sub(r"[^a-z0-9\s]", " ", col_name)
+    col_name = re.sub(r"\s+", " ", col_name).strip()
+
+    return col_name
+
+
+def load_column_mapping():
+    if not os.path.exists(COLUMN_MAPPING_FILE):
+        raise FileNotFoundError(
+            f"Column mapping file not found: {COLUMN_MAPPING_FILE}"
+        )
+
+    with open(COLUMN_MAPPING_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_synonym_lookup(column_mapping):
+    synonym_lookup = {}
+
+    for standard_name, synonyms in column_mapping.items():
+        # Also allow the standard name itself to match
+        synonym_lookup[normalize_column_name(standard_name)] = standard_name
+
+        for synonym in synonyms:
+            synonym_lookup[normalize_column_name(synonym)] = standard_name
+
+    return synonym_lookup
+
+
+def fuzzy_match_column(normalized_col, synonym_lookup, threshold=85):
+    possible_names = list(synonym_lookup.keys())
+
+    if not possible_names:
+        return None, 0
+
+    best_name = None
+    best_score = 0
+
+    for possible_name in possible_names:
+        score = SequenceMatcher(None, normalized_col, possible_name).ratio() * 100
+
+        if score > best_score:
+            best_score = score
+            best_name = possible_name
+
+    if best_score >= threshold:
+        return synonym_lookup[best_name], best_score
+
+    return None, best_score
+
+
+def apply_column_mapping(df, required_columns=None, fuzzy_threshold=85):
+    
+    df = df.copy()
+
+    column_mapping = load_column_mapping()
+    synonym_lookup = build_synonym_lookup(column_mapping)
+
+    rename_map = {}
+    mapped_standard_columns = set()
+
+    for original_col in df.columns:
+        normalized_col = normalize_column_name(original_col)
+
+        if normalized_col in synonym_lookup:
+            standard_name = synonym_lookup[normalized_col]
+
+            if standard_name not in mapped_standard_columns:
+                rename_map[original_col] = standard_name
+                mapped_standard_columns.add(standard_name)
+
+            else:
+                print(
+                    f"WARNING: Column '{original_col}' also maps to '{standard_name}', "
+                    "but that standard column was already mapped. Skipping duplicate."
+                )
+
+        else:
+            standard_name, score = fuzzy_match_column(
+                normalized_col,
+                synonym_lookup,
+                threshold=fuzzy_threshold
+            )
+
+            if standard_name and standard_name not in mapped_standard_columns:
+                rename_map[original_col] = standard_name
+                mapped_standard_columns.add(standard_name)
+
+            else:
+                print(
+                    f"WARNING: No column mapping found for '{original_col}'. "
+                    f"Best fuzzy score was {score}"
+                )
+
+    df = df.rename(columns=rename_map)
+
+    return df
+
+
 
 @dag(
     dag_id=DAG_ID,
@@ -235,16 +346,16 @@ def csm_pipeline():
             if not records:
                 return []
             df = pd.DataFrame(records)
+
+            required_columns = ["State", "LGA", "Case classification", "Outcome", "Date of symptom onset (dd/MM/yyyy)"]
+            df = apply_column_mapping(df, required_columns=required_columns, fuzzy_threshold=85)
+
             df.replace("null", pd.NA, inplace=True)
             
             if "age" in df.columns:
                 df["age"] = np.ceil(pd.to_numeric(df["age"], errors="coerce")).astype("Int64")
             
-            for col in ["date_of_symptom_onset_mm_dd_yyyy", "date_of_report_dd_mm_yyyy"]:
-                if col in df.columns and df[col].dtype == 'object':
-                    df[col] = df[col].astype(str)
-                    df[col] = pd.to_datetime(df[col], dayfirst=True, format="mixed", errors="coerce").dt.date
-                    df[col] = df[col].replace({pd.NaT: None})
+
             
             # df["epi_year"] = pd.to_datetime(df["date_of_symptom_onset"], errors="coerce").dt.isocalendar().year
             # df["epi_week_calculated"] =np.where(df['date_of_symptom_onset'].notnull(), pd.to_datetime(df["date_of_symptom_onset"], errors="coerce").dt.isocalendar().week, df['epi_week'].astype("Int64"))
@@ -259,13 +370,20 @@ def csm_pipeline():
             #     df["vaccinated_men5doses"] = df["vaccinated_men5doses"].map({"Vaccinated": "vaccinated", "Not Vaccinated": "unvaccinated", "Unvaccinated": "unvaccinated","Not applicable": "not applicable"}).fillna("missing")
             # if "sample_collected" in df.columns:
             #     df["sample_collected"] = df["sample_collected"].map({"Yes": True, "No": False}).astype("boolean").fillna(pd.NA)
-            if "outcome_of_case" in df.columns:
-                df["outcome_of_case"] = df["outcome_of_case"].str.strip().str.lower().fillna("missing")
+
                 
                 #df["outcome_of_case"] = df["outcome_of_case"].map({"alive":"Alive", "dead":"Dead"}).fillna("missing")
             
             # if "admitted_inpatient" in df.columns:
             #     df["admitted_inpatient"] = df["admitted_inpatient"].map({"In": "inpatient", "In patient": "inpatient","inpatient": "inpatient","outpatient": "outpatient","out-patient": "outpatient"}).fillna("missing")
+            for col in ["onset_date"]:
+                if col in df.columns and df[col].dtype == 'object':
+                    df[col] = df[col].astype(str)
+                    df[col] = pd.to_datetime(df[col], dayfirst=True, format="mixed", errors="coerce").dt.date
+                    df[col] = df[col].replace({pd.NaT: None})
+            if "outcome" in df.columns:
+                df["outcome"] = df["outcome"].str.strip().fillna("missing")
+
             if "result_positive_negative" in df.columns:
                 df["result_positive_negative"] = df["result_positive_negative"].str.strip().str.lower()
                 df["result_positive_negative"] = df["result_positive_negative"].map({"awaiting": "pending","NA": "not applicable"}).fillna(df["result_positive_negative"])          
@@ -476,13 +594,13 @@ def csm_pipeline():
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["disease_id", "date_of_symptom_onset_mm_dd_yyyy", "lga_id", "state_id","case_classification","outcome_of_case"]
+            required_cols = ["disease_id", "onset_date", "lga_id", "state_id","case_classification","outcome"]
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["disease_id", "onset_date", "lga_id", "state_id", "case_classification", "outcome_of_case"]
+            fact_df.columns = ["disease_id", "onset_date", "lga_id", "state_id", "case_classification", "outcome"]
             
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()

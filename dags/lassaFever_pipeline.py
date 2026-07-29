@@ -7,6 +7,9 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 import io
+import json
+import re 
+from difflib import SequenceMatcher
 
 
 DAG_ID = "lassaFever_linelist_pipeline"
@@ -61,6 +64,116 @@ def make_xcom_safe(df):
     df = df.replace({np.nan: None})
 
     return df
+
+DAG_DIR = os.path.dirname(os.path.abspath(__file__))
+COLUMN_MAPPING_FILE = os.path.join(DAG_DIR, "column_mappings.json")
+
+
+def normalize_column_name(col_name):
+    if col_name is None:
+        return ""
+
+    col_name = str(col_name).lower().strip()
+    col_name = col_name.replace("_", " ")
+    col_name = col_name.replace("-", " ")
+    col_name = re.sub(r"[^a-z0-9\s]", " ", col_name)
+    col_name = re.sub(r"\s+", " ", col_name).strip()
+
+    return col_name
+
+
+def load_column_mapping():
+    if not os.path.exists(COLUMN_MAPPING_FILE):
+        raise FileNotFoundError(
+            f"Column mapping file not found: {COLUMN_MAPPING_FILE}"
+        )
+
+    with open(COLUMN_MAPPING_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_synonym_lookup(column_mapping):
+    synonym_lookup = {}
+
+    for standard_name, synonyms in column_mapping.items():
+        # Also allow the standard name itself to match
+        synonym_lookup[normalize_column_name(standard_name)] = standard_name
+
+        for synonym in synonyms:
+            synonym_lookup[normalize_column_name(synonym)] = standard_name
+
+    return synonym_lookup
+
+
+def fuzzy_match_column(normalized_col, synonym_lookup, threshold=85):
+    possible_names = list(synonym_lookup.keys())
+
+    if not possible_names:
+        return None, 0
+
+    best_name = None
+    best_score = 0
+
+    for possible_name in possible_names:
+        score = SequenceMatcher(None, normalized_col, possible_name).ratio() * 100
+
+        if score > best_score:
+            best_score = score
+            best_name = possible_name
+
+    if best_score >= threshold:
+        return synonym_lookup[best_name], best_score
+
+    return None, best_score
+
+
+def apply_column_mapping(df, required_columns=None, fuzzy_threshold=85):
+    
+    df = df.copy()
+
+    column_mapping = load_column_mapping()
+    synonym_lookup = build_synonym_lookup(column_mapping)
+
+    rename_map = {}
+    mapped_standard_columns = set()
+
+    for original_col in df.columns:
+        normalized_col = normalize_column_name(original_col)
+
+        if normalized_col in synonym_lookup:
+            standard_name = synonym_lookup[normalized_col]
+
+            if standard_name not in mapped_standard_columns:
+                rename_map[original_col] = standard_name
+                mapped_standard_columns.add(standard_name)
+
+            else:
+                print(
+                    f"WARNING: Column '{original_col}' also maps to '{standard_name}', "
+                    "but that standard column was already mapped. Skipping duplicate."
+                )
+
+        else:
+            standard_name, score = fuzzy_match_column(
+                normalized_col,
+                synonym_lookup,
+                threshold=fuzzy_threshold
+            )
+
+            if standard_name and standard_name not in mapped_standard_columns:
+                rename_map[original_col] = standard_name
+                mapped_standard_columns.add(standard_name)
+
+            else:
+                print(
+                    f"WARNING: No column mapping found for '{original_col}'. "
+                    f"Best fuzzy score was {score}"
+                )
+
+    df = df.rename(columns=rename_map)
+
+    return df
+
 
 
 @dag(
@@ -166,6 +279,10 @@ def lassa_pipeline():
             if not records:
                 return []
             df = pd.DataFrame(records)
+
+            required_columns = ["State", "LGA", "Result Intepretation (Positive, Negative or Rejected)", "Epi Week", "Epi Year"]
+            df = apply_column_mapping(df, required_columns=required_columns, fuzzy_threshold=85)
+
             df.replace("null", pd.NA, inplace=True)
             # if "caseid" in df.columns:
             #     df.rename(columns={"caseid": "epid_number"}, inplace=True)
@@ -195,115 +312,21 @@ def lassa_pipeline():
             # for col in ["ct_value_qrt_pcr_i_target", "ct_value_qrt_pcr_ii_target"]:
             #     if col in df.columns:
             #         df[col] = df[col].fillna("missing")
-            
-            if "result_intepretation_positive_negative_or_rejected" in df.columns:
-                df["result_intepretation_positive_negative_or_rejected"] = df["result_intepretation_positive_negative_or_rejected"].map({"Positive": "positive", "Negative": "negative"}).fillna("missing")
+            print("columns in df after cleaning:", df.columns.tolist())
+            if "result" in df.columns:
+                df["result"] = df["result"].map({"Positive": "positive", "Negative": "negative"}).fillna("missing")
 
-                df["case_classification"] = np.where(df["result_intepretation_positive_negative_or_rejected"] == "positive", "confirmed",
-                                            np.where(df["result_intepretation_positive_negative_or_rejected"].isna(), "missing", "suspected"))
+                df["case_classification"] = np.where(df["result"] == "positive", "confirmed",
+                                            np.where(df["result"].isna(), "missing", "suspected"))
 
             # for col in ["date_of_specimen_collection", "date_specimen_received_at_lab", "date_specimen_tested"]:
             #     if col in df.columns:
             #         df[col] = pd.to_datetime(df[col], errors="coerce").dt.date.where(pd.to_datetime(df[col], errors="coerce").notna(), None)
 
-            return df.to_dict("records")
+            return make_xcom_safe(df).to_dict("records")
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
-    # -------------------------
-    # Validation
-    # -------------------------
-    # @task
-    # def validate_data(records, **context):
-    #     conn = None
-    #     try:
-    #         if not records:
-    #             return []
-            
-    #         df = pd.DataFrame(records)
-    #         dag_run = context["dag_run"]   
-    #         ti = context["task_instance"]     
-    #         rec_no = len(df)
-    #         # valid_rows = []
-    #         failures = []
-    #         print(f"Starting validate_data with {rec_no} records")
-            
-    #         for idx, row in df.iterrows():
-    #             try:
-    #                 age = pd.to_numeric(row.get("age"), errors="coerce")
 
-    #                 if pd.isna(row.get("state")) and pd.isna(row.get("lga")):
-    #                     failures.append((int(idx),"Missing location",dag_run.run_id, ti.dag_id))
-
-    #                 elif pd.isna(age) or age < 0 or age > 120: 
-    #                     failures.append((int(idx),"Invalid age",dag_run.run_id, ti.dag_id))
-
-    #                 elif pd.isna(row.get("epid_number")):
-    #                     failures.append((int(idx),"Missing Epid number",dag_run.run_id, ti.dag_id))
-    #                 else:
-    #                     pass
-    #                     # valid_rows.append(row)
-    #             except Exception as row_error:
-    #                 print(f"Row {idx} failed with error: {row_error}")
-    #                 failures.append((int(idx),f"Row processing error: {str(row_error)}",dag_run.run_id, ti.dag_id))
-    #         if failures:
-    #             try:
-    #                 hook = PostgresHook(postgres_conn_id=dw_conn_id)
-    #                 conn = hook.get_conn()
-    #                 cur = conn.cursor()
-    #                 cur.executemany("""
-    #                 INSERT INTO etl_validation_failures
-    #                 (row_number,failure_reason, run_id, dag_id)
-    #                 VALUES (%s,%s,%s,%s)
-    #                 """, failures)
-    #                 conn.commit()
-    #             except Exception as db_error:
-    #                 print(f"DB Error inserting validation failures: {str(db_error)}")
-    #                 if conn:
-    #                     conn.rollback()
-    #                 raise Exception(f"Error inserting validation failures: {str(db_error)}") from db_error
-    #             finally:
-    #                 if conn:
-    #                     try:
-    #                         conn.close()
-    #                     except:
-    #                         pass
-
-    #         df_valid = make_xcom_safe(df)
-            
-    #         return df_valid.to_dict("records")
-            
-            
-    #     except Exception as e:
-    #         print(f"CRITICAL ERROR in validate_data: {str(e)}")
-    #         raise Exception(f"Error in validate_data: {str(e)}") from e
-
-
-    # # -------------------------
-    # # Deduplication
-    # # -------------------------
-    # @task
-    # def deduplicate(records):
-    #     try:
-    #         if not records:
-    #             print("WARNING: deduplicate received empty list, returning empty")
-    #             return []
-            
-    #         df = pd.DataFrame(records)
-            
-    #         if "epid_number" in df.columns:
-    #             df = df.drop_duplicates(subset=["epid_number"])
-    #         else:
-    #             df = df.drop_duplicates()
-
-    #         return make_xcom_safe(df).to_dict("records")
-    #     except Exception as e:
-    #         print(f"CRITICAL ERROR in deduplicate: {str(e)}")
-    #         raise Exception(f"Error in deduplicate: {str(e)}") from e
-
-
-    # -------------------------
-    # Dimension Resolution
-    # -------------------------
     @task
     def resolve_dimensions(records):
         try:
@@ -459,12 +482,11 @@ def lassa_pipeline():
                             ELSE 0 
                         END
                     ) AS confirmed,
-                    '' AS deaths
+                    0 AS deaths
                 FROM tmp_core_surveillance_fact c
                 JOIN master_disease d ON c.disease_id = d.disease_id
                 LEFT JOIN master_state s ON c.state_id = s.state_id
                 LEFT JOIN master_lga l ON c.lga_id = l.lga_id
-                WHERE c.onset_date IS NOT NULL
                 GROUP BY
                     d.disease_name,
                     c.epi_year,

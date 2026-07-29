@@ -7,7 +7,9 @@ import pandas as pd
 import numpy as np
 import io
 import os
-
+import json
+import re 
+from difflib import SequenceMatcher
 
 DAG_ID = "measles_linelist_pipeline"
 staging_conn_id = "staging_postgres_db"
@@ -61,6 +63,116 @@ def make_xcom_safe(df):
     df = df.replace({np.nan: None})
 
     return df
+
+DAG_DIR = os.path.dirname(os.path.abspath(__file__))
+COLUMN_MAPPING_FILE = os.path.join(DAG_DIR, "column_mappings.json")
+
+
+def normalize_column_name(col_name):
+    if col_name is None:
+        return ""
+
+    col_name = str(col_name).lower().strip()
+    col_name = col_name.replace("_", " ")
+    col_name = col_name.replace("-", " ")
+    col_name = re.sub(r"[^a-z0-9\s]", " ", col_name)
+    col_name = re.sub(r"\s+", " ", col_name).strip()
+
+    return col_name
+
+
+def load_column_mapping():
+    if not os.path.exists(COLUMN_MAPPING_FILE):
+        raise FileNotFoundError(
+            f"Column mapping file not found: {COLUMN_MAPPING_FILE}"
+        )
+
+    with open(COLUMN_MAPPING_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_synonym_lookup(column_mapping):
+    synonym_lookup = {}
+
+    for standard_name, synonyms in column_mapping.items():
+        # Also allow the standard name itself to match
+        synonym_lookup[normalize_column_name(standard_name)] = standard_name
+
+        for synonym in synonyms:
+            synonym_lookup[normalize_column_name(synonym)] = standard_name
+
+    return synonym_lookup
+
+
+def fuzzy_match_column(normalized_col, synonym_lookup, threshold=85):
+    possible_names = list(synonym_lookup.keys())
+
+    if not possible_names:
+        return None, 0
+
+    best_name = None
+    best_score = 0
+
+    for possible_name in possible_names:
+        score = SequenceMatcher(None, normalized_col, possible_name).ratio() * 100
+
+        if score > best_score:
+            best_score = score
+            best_name = possible_name
+
+    if best_score >= threshold:
+        return synonym_lookup[best_name], best_score
+
+    return None, best_score
+
+
+def apply_column_mapping(df, required_columns=None, fuzzy_threshold=85):
+    
+    df = df.copy()
+
+    column_mapping = load_column_mapping()
+    synonym_lookup = build_synonym_lookup(column_mapping)
+
+    rename_map = {}
+    mapped_standard_columns = set()
+
+    for original_col in df.columns:
+        normalized_col = normalize_column_name(original_col)
+
+        if normalized_col in synonym_lookup:
+            standard_name = synonym_lookup[normalized_col]
+
+            if standard_name not in mapped_standard_columns:
+                rename_map[original_col] = standard_name
+                mapped_standard_columns.add(standard_name)
+
+            else:
+                print(
+                    f"WARNING: Column '{original_col}' also maps to '{standard_name}', "
+                    "but that standard column was already mapped. Skipping duplicate."
+                )
+
+        else:
+            standard_name, score = fuzzy_match_column(
+                normalized_col,
+                synonym_lookup,
+                threshold=fuzzy_threshold
+            )
+
+            if standard_name and standard_name not in mapped_standard_columns:
+                rename_map[original_col] = standard_name
+                mapped_standard_columns.add(standard_name)
+
+            else:
+                print(
+                    f"WARNING: No column mapping found for '{original_col}'. "
+                    f"Best fuzzy score was {score}"
+                )
+
+    df = df.rename(columns=rename_map)
+
+    return df
+
 
 @dag(
     dag_id=DAG_ID,
@@ -159,27 +271,24 @@ def measles_pipeline():
             if not records:
                 return []
             df = pd.DataFrame(records)
+
+            required_columns = ["Week Num", "ReportingDistrict", "DateOfonset", "ProvinceOfResidence", "Outcome","Year", "IgM result"]
+            df = apply_column_mapping(df, required_columns=required_columns, fuzzy_threshold=85)
+
             df.replace("null", pd.NA, inplace=True)
 
             df.columns = df.columns.str.lower()
-            # Outcome, IgM Result
-            if "labresults_rdt" in df.columns:
-                df["labresults_rdt"] = df["labresults_rdt"].str.strip().str.lower()
-                df["labresults_rdt"] = df["labresults_rdt"].map({"not done":"not_done"}).fillna(df["labresults_rdt"])
-            if "labresults_cul" in df.columns:
-                df["labresults_cul"] = df["labresults_cul"].str.strip().str.lower()
-                df["labresults_cul"] = df["labresults_cul"].map({"not done":"not_done"}).fillna(df["labresults_cul"])
-
-            if "labresults_rdt" in df.columns and "labresults_cul" in df.columns:
-                df["case_classification"] = np.where(
-                        (df["labresults_rdt"].str.lower() == "positive") | (df["labresults_cul"].str.lower() == "positive"), "confirmed",
-                    np.where(
-                        df["labresults_rdt"].isna() & df["labresults_cul"].isna(), "missing",
-                        "suspected"
-                    )
-                )
+            if "epi_week" in df.columns:
+                df["epi_week"] = df["epi_week"].str.split().str[-1].astype("int")
+                            # Outcome, IgM Result
+            if "outcome" in df.columns:
+                df["outcome"] = df["outcome"].str.strip().str.lower()
+                df["outcome"] = np.where(df["outcome"].isin(["dead", "died", "death"]), "Dead", "Alive")
+            if "result" in df.columns:
+                #clean the result column
+                df["case_classification"] = np.where(df["result"].str.lower().isin(["positive", "1=pos"]), "confirmed", "suspected")
             
-            return df.to_dict("records")
+            return make_xcom_safe(df).to_dict("records")
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
 
@@ -217,9 +326,9 @@ def measles_pipeline():
             else:
                 raise Exception("Missing 'lga' or 'state_id' column in data")
 
-            disease = dw.get_pandas_df("SELECT disease_id FROM master_disease WHERE disease_name='measles'")
+            disease = dw.get_pandas_df("SELECT disease_id FROM master_disease WHERE disease_name='Measles'")
             if disease is None or disease.empty:
-                raise Exception("No disease found with name 'measles'")
+                raise Exception("No disease found with name 'Measles'")
 
             df["disease_id"] = disease.iloc[0]["disease_id"]
 
@@ -246,13 +355,13 @@ def measles_pipeline():
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["disease_id", "lga_id", "state_id","case_classification","epi_week","epi_year"]
+            required_cols = ["disease_id", "lga_id", "state_id","case_classification","epi_week","epi_year","outcome"]
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["disease_id", "lga_id", "state_id", "case_classification","epi_week","epi_year"]
+            fact_df.columns = ["disease_id", "lga_id", "state_id", "case_classification","epi_week","epi_year","outcome"]
             
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
@@ -265,7 +374,8 @@ def measles_pipeline():
                             state_id INT,
                             case_classification VARCHAR(50),
                             epi_week INT,
-                            epi_year INT
+                            epi_year INT,
+                            outcome VARCHAR(50)
                         ) ON COMMIT DROP
                         """)
                         
@@ -275,7 +385,7 @@ def measles_pipeline():
 
             cur.copy_expert("""
             COPY tmp_core_surveillance_fact
-            (disease_id,lga_id,state_id,case_classification,epi_week,epi_year)
+            (disease_id,lga_id,state_id,case_classification,epi_week,epi_year,outcome)
             FROM STDIN WITH CSV
             """, buffer)
 
@@ -306,7 +416,6 @@ def measles_pipeline():
                 JOIN master_disease d ON c.disease_id = d.disease_id
                 LEFT JOIN master_state s ON c.state_id = s.state_id
                 LEFT JOIN master_lga l ON c.lga_id = l.lga_id
-                WHERE c.onset_date IS NOT NULL
                 GROUP BY
                     d.disease_name,
                     c.epi_year,
