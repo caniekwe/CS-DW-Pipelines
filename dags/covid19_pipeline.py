@@ -355,6 +355,10 @@ def covid19_pipeline():
     @task
     def load_covid19_data(records): #check where to get the epi_year value from
         try:
+            hook = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = hook.get_conn()
+            cur = conn.cursor()
+
             if not records:
                 print("WARNING: load_covid19_data received empty list, returning empty DataFrame")
                 return []
@@ -372,10 +376,6 @@ def covid19_pipeline():
             
             fact_df = df[required_cols].copy()
             fact_df.columns = ["disease_id", "lga_id", "state_id", "case_classification","epi_week","report_date","outcome"]
-            
-            hook = PostgresHook(postgres_conn_id=dw_conn_id)
-            conn = hook.get_conn()
-            cur = conn.cursor()
 
             cur.execute("""
                         CREATE TEMP TABLE tmp_core_surveillance_fact (
@@ -446,15 +446,6 @@ def covid19_pipeline():
             return True
         except Exception as e:
             raise Exception(f"Error in aggregating covid19 surveillance data from the data warehouse: {str(e)}") from e
-
-        # finally:
-        #     if conn:
-        #         try:
-        #             if cur:
-        #                 cur.close()
-        #             conn.close()
-        #         except:
-        #             pass
 
     # # -------------------------
     # Run Logging - End
