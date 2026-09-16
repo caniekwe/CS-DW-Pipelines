@@ -25,7 +25,8 @@
         "epid week",
         "week",
         "Week num",
-        "reporting week"
+        "reporting week",
+        "WeekNos1"
     ],
     "epi_year": [
         "epi year",
@@ -40,7 +41,9 @@
         "residence state",
         "state of residence",
         "state of resident",
-        "ProvinceOfResidence"
+        "ProvinceOfResidence",
+        "State (of case residence)",
+        "state of (health facility or place of detection)"
     ],
     "lga": [
         "lga",
@@ -49,13 +52,16 @@
         "local govt area",
         "residence lga",
         "lga of residence",
-        "ReportingDistrict"
+        "ReportingDistrict",
+        "LGA (of case residence)",
+        "lga of (health facility or place of detection)"
     ],
     "outcome": [
         "outcome",
         "case outcome",
         "patient outcome",
-        "final outcome"
+        "final outcome",
+        "Outcome of case"
     ],
     "result": [
         "sars cov 2",
@@ -75,6 +81,7 @@
         "case classification",
         "classification",
         "case status",
-        "final classification"
+        "final classification",
+        "Final classification (Confirmed,Negative,Indeterminate,Pending, Not Done)"
     ]
 }

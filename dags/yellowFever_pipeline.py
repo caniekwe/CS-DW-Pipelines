@@ -7,7 +7,9 @@ import pandas as pd
 import numpy as np
 import io
 import os
-
+import json
+import re 
+from difflib import SequenceMatcher
 
 DAG_ID = "yellowFever_linelist_pipeline"
 staging_conn_id = "staging_postgres_db"
@@ -61,6 +63,116 @@ def make_xcom_safe(df):
     df = df.replace({np.nan: None})
 
     return df
+
+DAG_DIR = os.path.dirname(os.path.abspath(__file__))
+COLUMN_MAPPING_FILE = os.path.join(DAG_DIR, "column_mappings.json")
+
+
+def normalize_column_name(col_name):
+    if col_name is None:
+        return ""
+
+    col_name = str(col_name).lower().strip()
+    col_name = col_name.replace("_", " ")
+    col_name = col_name.replace("-", " ")
+    col_name = re.sub(r"[^a-z0-9\s]", " ", col_name)
+    col_name = re.sub(r"\s+", " ", col_name).strip()
+
+    return col_name
+
+
+def load_column_mapping():
+    if not os.path.exists(COLUMN_MAPPING_FILE):
+        raise FileNotFoundError(
+            f"Column mapping file not found: {COLUMN_MAPPING_FILE}"
+        )
+
+    with open(COLUMN_MAPPING_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_synonym_lookup(column_mapping):
+    synonym_lookup = {}
+
+    for standard_name, synonyms in column_mapping.items():
+        # Also allow the standard name itself to match
+        synonym_lookup[normalize_column_name(standard_name)] = standard_name
+
+        for synonym in synonyms:
+            synonym_lookup[normalize_column_name(synonym)] = standard_name
+
+    return synonym_lookup
+
+
+def fuzzy_match_column(normalized_col, synonym_lookup, threshold=85):
+    possible_names = list(synonym_lookup.keys())
+
+    if not possible_names:
+        return None, 0
+
+    best_name = None
+    best_score = 0
+
+    for possible_name in possible_names:
+        score = SequenceMatcher(None, normalized_col, possible_name).ratio() * 100
+
+        if score > best_score:
+            best_score = score
+            best_name = possible_name
+
+    if best_score >= threshold:
+        return synonym_lookup[best_name], best_score
+
+    return None, best_score
+
+
+def apply_column_mapping(df, required_columns=None, fuzzy_threshold=85):
+    
+    df = df.copy()
+
+    column_mapping = load_column_mapping()
+    synonym_lookup = build_synonym_lookup(column_mapping)
+
+    rename_map = {}
+    mapped_standard_columns = set()
+
+    for original_col in df.columns:
+        normalized_col = normalize_column_name(original_col)
+
+        if normalized_col in synonym_lookup:
+            standard_name = synonym_lookup[normalized_col]
+
+            if standard_name not in mapped_standard_columns:
+                rename_map[original_col] = standard_name
+                mapped_standard_columns.add(standard_name)
+
+            else:
+                print(
+                    f"WARNING: Column '{original_col}' also maps to '{standard_name}', "
+                    "but that standard column was already mapped. Skipping duplicate."
+                )
+
+        else:
+            standard_name, score = fuzzy_match_column(
+                normalized_col,
+                synonym_lookup,
+                threshold=fuzzy_threshold
+            )
+
+            if standard_name and standard_name not in mapped_standard_columns:
+                rename_map[original_col] = standard_name
+                mapped_standard_columns.add(standard_name)
+
+            else:
+                print(
+                    f"WARNING: No column mapping found for '{original_col}'. "
+                    f"Best fuzzy score was {score}"
+                )
+
+    df = df.rename(columns=rename_map)
+
+    return df
+
 
 @dag(
     dag_id=DAG_ID,
@@ -159,6 +271,10 @@ def yellowFever_pipeline():
             if not records:
                 return []
             df = pd.DataFrame(records)
+
+            required_columns = ["WeekNos1", "LGA", "Final classification (Confirmed,Negative,Indeterminate,Pending, Not Done)", "STATE", "Outcome"]
+            df = apply_column_mapping(df, required_columns=required_columns, fuzzy_threshold=85)
+
             df.replace("null", pd.NA, inplace=True)
 
             df.columns = df.columns.str.lower()

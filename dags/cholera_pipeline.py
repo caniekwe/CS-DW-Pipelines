@@ -438,147 +438,7 @@ def cholera_pipeline():
             raise Exception(f"Error in resolve_dimensions: {str(e)}") from e
     
 
-    # @task
-    # def apply_case_versioning(records):
-
-    #     try:
-    #         if not records:
-    #             print("WARNING: apply_case_versioning received empty list, returning empty")
-    #             return []
-            
-    #         df = pd.DataFrame(records)
-    #         dw = PostgresHook(postgres_conn_id=dw_conn_id)
-
-    #         try:
-    #             existing = dw.get_pandas_df("SELECT epid_number, MAX(case_version) AS version FROM core_case_fact GROUP BY epid_number")
-    #         except Exception as query_error:
-    #             print(f"Warning: Could not query existing case versions: {str(query_error)}")
-    #             existing = None
-            
-    #         if existing is None or existing.empty:
-    #             existing = pd.DataFrame(columns=["epid_number", "version"])
-            
-    #         if "epid_number" in df.columns:
-    #             df = df.merge(existing, on="epid_number", how="left")
-            
-    #         df["case_version"] = df["version"].fillna(0) + 1
-    #         df = df.convert_dtypes()
-    #         df = df.where(pd.notnull(df), None)
-
-    #         return make_xcom_safe(df).to_dict("records")
-    #     except Exception as e:
-    #         print(f"CRITICAL ERROR in apply_case_versioning: {str(e)}")
-    #         raise Exception(f"Error in apply_case_versioning: {str(e)}") from e
-
-    # @task
-    # def load_core_fact_table(records):
-    #     conn = None
-    #     cur = None
-    #     try:
-    #         if not records:
-    #             print("WARNING: load_core_fact_table received empty list, returning empty DataFrame")
-    #             return pd.DataFrame(columns=["case_fact_id", "epid_number"])
-            
-    #         df = pd.DataFrame(records)
-
-    #         for col in ["lga_id", "state_id","age","wk","yr"]:
-    #             if col in df.columns:
-    #                 df[col] = df[col].astype("Int64")
-            
-    #         required_cols = ["disease_id", "date_of_onset", "lga_id", "state_id","outcome"]
-
-    #         missing_cols = [col for col in required_cols if col not in df.columns]
-    #         if missing_cols:
-    #             raise Exception(f"Missing required columns: {missing_cols}")
-            
-    #         fact_df = df[required_cols].copy()
-    #         fact_df.columns = ["epid_number", "disease_id", "onset_date", "sex", "age", "lga_id", "state_id", "case_classification", "outcome", "hospitalisation_status", "source_system", "case_version","wk","yr"]
-            
-    #         hook = PostgresHook(postgres_conn_id=dw_conn_id)
-    #         conn = hook.get_conn()
-    #         cur = conn.cursor()
-
-    #         cur.execute("""
-    #         CREATE TEMP TABLE tmp_core_case_fact (
-    #             epid_number VARCHAR(50),
-    #             disease_id INT,
-    #             onset_date DATE,
-    #             sex VARCHAR(10),
-    #             age INT,
-    #             lga_id INT, 
-    #             state_id INT,
-    #             case_classification VARCHAR(50),
-    #             outcome VARCHAR(50),
-    #             hospitalisation_status VARCHAR(50),
-    #             source_system INT,
-    #             case_version INT,
-    #             epi_week INT,
-    #             epi_year INT
-    #         ) ON COMMIT DROP
-    #         """)
-            
-    #         buffer = io.StringIO()
-    #         fact_df.to_csv(buffer, index=False, header=False)
-    #         buffer.seek(0)
-
-    #         cur.copy_expert("""
-    #         COPY tmp_core_case_fact
-    #         (epid_number,disease_id,onset_date,sex,age,
-    #         lga_id,state_id,case_classification,outcome,hospitalisation_status,
-    #         source_system,case_version,epi_week, epi_year)
-    #         FROM STDIN WITH CSV
-    #         """, buffer)
-
-    #         cur.execute("""
-    #         INSERT INTO core_case_fact
-    #         (epid_number,disease_id,onset_date,sex,age,
-    #         lga_id,state_id,case_classification,outcome,hospitalisation_status,
-    #         source_system,case_version,epi_week, epi_year)
-    #         SELECT epid_number,disease_id,onset_date,sex,age,
-    #             lga_id,state_id,case_classification,outcome,hospitalisation_status,
-    #             source_system,case_version,epi_week, epi_year
-    #         FROM tmp_core_case_fact
-    #         ON CONFLICT (epid_number) DO UPDATE
-    #         SET
-    #             disease_id = EXCLUDED.disease_id,
-    #             onset_date = EXCLUDED.onset_date,
-    #             sex = EXCLUDED.sex,
-    #             age = EXCLUDED.age,
-    #             lga_id = EXCLUDED.lga_id,
-    #             state_id = EXCLUDED.state_id,
-    #             case_classification = EXCLUDED.case_classification,
-    #             outcome = EXCLUDED.outcome,
-    #             hospitalisation_status = EXCLUDED.hospitalisation_status,
-    #             source_system = EXCLUDED.source_system,
-    #             case_version = EXCLUDED.case_version,
-    #             epi_week = EXCLUDED.epi_week,
-    #             epi_year = EXCLUDED.epi_year           
-    #         RETURNING case_fact_id, epid_number
-    #         """)
-
-    #         inserted_rows = cur.fetchall()
-    #         if not inserted_rows:
-    #             raise Exception("No rows inserted into core_case_fact table")
-            
-    #         conn.commit()
-    #         inserted_df = make_xcom_safe(pd.DataFrame(inserted_rows, columns=["case_fact_id", "epid_number"]))
-    #         return inserted_df.to_dict("records")
-    #     except Exception as e:
-    #         print(f"CRITICAL ERROR in load_core_fact_table: {str(e)}")
-    #         if conn:
-    #             conn.rollback()
-    #         raise Exception(f"Error in load_core_fact_table: {str(e)}") from e
-    #     finally:
-    #         if conn:
-    #             try:
-    #                 if cur:
-    #                     cur.close()
-    #                 conn.close()
-    #             except:
-    #                 pass
-
-    # @task
-    # def load_cholera_extension_table(records, inserted_cases_df):
+    
     #     conn = None
     #     cur = None
     #     try:
@@ -677,6 +537,10 @@ def cholera_pipeline():
     @task
     def load_cholera_data(records):
         try:
+            warehouse = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = warehouse.get_conn()
+            cur = conn.cursor()
+
             if not records:
                 print("WARNING: load_cholera_data received empty list, returning empty DataFrame")
                 return []
@@ -696,10 +560,7 @@ def cholera_pipeline():
             fact_df = df[required_cols].copy()
             fact_df.columns = ["disease_id", "onset_date", "lga_id", "state_id", "case_classification", "outcome"]
 
-            warehouse = PostgresHook(postgres_conn_id=dw_conn_id)
-            conn = warehouse.get_conn()
-            cur = conn.cursor()
-
+            
             cur.execute("""
                         CREATE TEMP TABLE tmp_core_surveillance_fact (
                             disease_id INT,

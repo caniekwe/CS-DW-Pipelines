@@ -7,6 +7,9 @@ import pandas as pd
 import numpy as np
 import io
 import os
+import json
+import re 
+from difflib import SequenceMatcher
 
 
 DAG_ID = "afp_linelist_pipeline"
@@ -59,6 +62,115 @@ def make_xcom_safe(df):
 
     # Replace NaN / NaT with None
     df = df.replace({np.nan: None})
+
+    return df
+
+DAG_DIR = os.path.dirname(os.path.abspath(__file__))
+COLUMN_MAPPING_FILE = os.path.join(DAG_DIR, "column_mappings.json")
+
+
+def normalize_column_name(col_name):
+    if col_name is None:
+        return ""
+
+    col_name = str(col_name).lower().strip()
+    col_name = col_name.replace("_", " ")
+    col_name = col_name.replace("-", " ")
+    col_name = re.sub(r"[^a-z0-9\s]", " ", col_name)
+    col_name = re.sub(r"\s+", " ", col_name).strip()
+
+    return col_name
+
+
+def load_column_mapping():
+    if not os.path.exists(COLUMN_MAPPING_FILE):
+        raise FileNotFoundError(
+            f"Column mapping file not found: {COLUMN_MAPPING_FILE}"
+        )
+
+    with open(COLUMN_MAPPING_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_synonym_lookup(column_mapping):
+    synonym_lookup = {}
+
+    for standard_name, synonyms in column_mapping.items():
+        # Also allow the standard name itself to match
+        synonym_lookup[normalize_column_name(standard_name)] = standard_name
+
+        for synonym in synonyms:
+            synonym_lookup[normalize_column_name(synonym)] = standard_name
+
+    return synonym_lookup
+
+
+def fuzzy_match_column(normalized_col, synonym_lookup, threshold=85):
+    possible_names = list(synonym_lookup.keys())
+
+    if not possible_names:
+        return None, 0
+
+    best_name = None
+    best_score = 0
+
+    for possible_name in possible_names:
+        score = SequenceMatcher(None, normalized_col, possible_name).ratio() * 100
+
+        if score > best_score:
+            best_score = score
+            best_name = possible_name
+
+    if best_score >= threshold:
+        return synonym_lookup[best_name], best_score
+
+    return None, best_score
+
+
+def apply_column_mapping(df, required_columns=None, fuzzy_threshold=85):
+    
+    df = df.copy()
+
+    column_mapping = load_column_mapping()
+    synonym_lookup = build_synonym_lookup(column_mapping)
+
+    rename_map = {}
+    mapped_standard_columns = set()
+
+    for original_col in df.columns:
+        normalized_col = normalize_column_name(original_col)
+
+        if normalized_col in synonym_lookup:
+            standard_name = synonym_lookup[normalized_col]
+
+            if standard_name not in mapped_standard_columns:
+                rename_map[original_col] = standard_name
+                mapped_standard_columns.add(standard_name)
+
+            else:
+                print(
+                    f"WARNING: Column '{original_col}' also maps to '{standard_name}', "
+                    "but that standard column was already mapped. Skipping duplicate."
+                )
+
+        else:
+            standard_name, score = fuzzy_match_column(
+                normalized_col,
+                synonym_lookup,
+                threshold=fuzzy_threshold
+            )
+
+            if standard_name and standard_name not in mapped_standard_columns:
+                rename_map[original_col] = standard_name
+                mapped_standard_columns.add(standard_name)
+
+            else:
+                print(
+                    f"WARNING: No column mapping found for '{original_col}'. "
+                    f"Best fuzzy score was {score}"
+                )
+
+    df = df.rename(columns=rename_map)
 
     return df
 
@@ -159,27 +271,24 @@ def afp_pipeline():
             if not records:
                 return []
             df = pd.DataFrame(records)
+
+            required_columns = ["case classification", "Date of symptom onset", "outcome of case", "state of (health facility or place of detection)", "State (of case residence)", "LGA (of case residence)", "lga of (health facility or place of detection)"]
+            df = apply_column_mapping(df, required_columns=required_columns, fuzzy_threshold=85)
+
             df.replace("null", pd.NA, inplace=True)
 
             df.columns = df.columns.str.lower()
-            # Outcome, IgM Result
-            if "labresults_rdt" in df.columns:
-                df["labresults_rdt"] = df["labresults_rdt"].str.strip().str.lower()
-                df["labresults_rdt"] = df["labresults_rdt"].map({"not done":"not_done"}).fillna(df["labresults_rdt"])
-            if "labresults_cul" in df.columns:
-                df["labresults_cul"] = df["labresults_cul"].str.strip().str.lower()
-                df["labresults_cul"] = df["labresults_cul"].map({"not done":"not_done"}).fillna(df["labresults_cul"])
-
-            if "labresults_rdt" in df.columns and "labresults_cul" in df.columns:
-                df["case_classification"] = np.where(
-                        (df["labresults_rdt"].str.lower() == "positive") | (df["labresults_cul"].str.lower() == "positive"), "confirmed",
-                    np.where(
-                        df["labresults_rdt"].isna() & df["labresults_cul"].isna(), "missing",
-                        "suspected"
-                    )
-                )
             
-            return df.to_dict("records")
+            if "case_classification" in df.columns:
+                df["case_classification"] = df["case_classification"].str.strip().str.lower()
+
+            if "outcome" in df.columns:
+                df["outcome"] = df["outcome"].str.strip().str.lower()
+
+            if "onset_date" in df.columns:
+                df["onset_date"] = pd.to_datetime(df["onset_date"], errors="coerce")
+            
+            return make_xcom_safe(df).to_dict("records")
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
 
@@ -217,9 +326,9 @@ def afp_pipeline():
             else:
                 raise Exception("Missing 'lga' or 'state_id' column in data")
 
-            disease = dw.get_pandas_df("SELECT disease_id FROM master_disease WHERE disease_name='afp'")
+            disease = dw.get_pandas_df("SELECT disease_id FROM master_disease WHERE disease_name='Acute flaccid paralysis (AFP)'")
             if disease is None or disease.empty:
-                raise Exception("No disease found with name 'afp'")
+                raise Exception("No disease found with name 'Acute flaccid paralysis (AFP)'")
 
             df["disease_id"] = disease.iloc[0]["disease_id"]
 
@@ -236,6 +345,10 @@ def afp_pipeline():
     @task
     def load_afp_data(records):
         try:
+            hook = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = hook.get_conn()
+            cur = conn.cursor()
+        
             if not records:
                 print("WARNING: load_afp_data received empty list, returning empty DataFrame")
                 return []
@@ -246,26 +359,22 @@ def afp_pipeline():
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["disease_id", "lga_id", "state_id","case_classification","epi_week","epi_year"]
+            required_cols = ["disease_id", "lga_id", "state_id","case_classification","onset_date", "outcome"]
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["disease_id", "lga_id", "state_id", "case_classification","epi_week","epi_year"]
+            fact_df.columns = ["disease_id", "lga_id", "state_id", "case_classification","onset_date", "outcome"]
             
-            hook = PostgresHook(postgres_conn_id=dw_conn_id)
-            conn = hook.get_conn()
-            cur = conn.cursor()
-
             cur.execute("""
                         CREATE TEMP TABLE tmp_core_surveillance_fact (
                             disease_id INT,
                             lga_id INT, 
                             state_id INT,
                             case_classification VARCHAR(50),
-                            epi_week INT,
-                            epi_year INT
+                            onset_date DATE,
+                            outcome VARCHAR(50)
                         ) ON COMMIT DROP
                         """)
                         
@@ -275,7 +384,7 @@ def afp_pipeline():
 
             cur.copy_expert("""
             COPY tmp_core_surveillance_fact
-            (disease_id,lga_id,state_id,case_classification,epi_week,epi_year)
+            (disease_id,lga_id,state_id,case_classification,onset_date, outcome)
             FROM STDIN WITH CSV
             """, buffer)
 
@@ -285,8 +394,8 @@ def afp_pipeline():
                 )
                 SELECT
                     d.disease_name AS disease,
-                    c.epi_year,
-                    c.epi_week,
+                    EXTRACT(ISOYEAR FROM c.onset_date) AS epi_year,
+                    EXTRACT(WEEK FROM c.onset_date) AS epi_week,
                     s.state_name AS state,
                     l.lga_name AS lga,
                     COUNT(*) AS suspected,
@@ -298,7 +407,7 @@ def afp_pipeline():
                     ) AS confirmed,
                     SUM(
                         CASE 
-                            WHEN c.outcome = 'Dead' THEN 1 
+                            WHEN c.outcome = 'deceased' THEN 1 
                             ELSE 0 
                         END
                     ) AS deaths
@@ -309,8 +418,8 @@ def afp_pipeline():
                 WHERE c.onset_date IS NOT NULL
                 GROUP BY
                     d.disease_name,
-                    c.epi_year,
-                    c.epi_week,
+                    EXTRACT(ISOYEAR FROM c.onset_date),
+                    EXTRACT(WEEK FROM c.onset_date),
                     s.state_name,
                     l.lga_id
                 ON CONFLICT (disease, epi_year, epi_week, state, lga)
