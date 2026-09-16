@@ -354,28 +354,7 @@ def csm_pipeline():
             
             if "age" in df.columns:
                 df["age"] = np.ceil(pd.to_numeric(df["age"], errors="coerce")).astype("Int64")
-            
-
-            
-            # df["epi_year"] = pd.to_datetime(df["date_of_symptom_onset"], errors="coerce").dt.isocalendar().year
-            # df["epi_week_calculated"] =np.where(df['date_of_symptom_onset'].notnull(), pd.to_datetime(df["date_of_symptom_onset"], errors="coerce").dt.isocalendar().week, df['epi_week'].astype("Int64"))
-            #df["epi_week_calculated"] = pd.to_datetime(df["date_of_symptom_onset_mm_dd_yyyy"], errors="coerce").dt.isocalendar().week
-
-            # if "gender" in df.columns:
-            #     df["gender"] = df["gender"].str.strip().str.lower()
-            #     df["gender"] = df["gender"].map({"m": "male", "f": "female"}).fillna("missing")
-            # if "vaccination" in df.columns:
-            #     df["vaccination"] = df["vaccination"].map({"Unknown": "unknown", "Vaccinated": "vaccinated", "Not Vaccinated": "unvaccinated"}).fillna("missing")
-            # if "vaccinated_men5doses" in df.columns:
-            #     df["vaccinated_men5doses"] = df["vaccinated_men5doses"].map({"Vaccinated": "vaccinated", "Not Vaccinated": "unvaccinated", "Unvaccinated": "unvaccinated","Not applicable": "not applicable"}).fillna("missing")
-            # if "sample_collected" in df.columns:
-            #     df["sample_collected"] = df["sample_collected"].map({"Yes": True, "No": False}).astype("boolean").fillna(pd.NA)
-
-                
-                #df["outcome_of_case"] = df["outcome_of_case"].map({"alive":"Alive", "dead":"Dead"}).fillna("missing")
-            
-            # if "admitted_inpatient" in df.columns:
-            #     df["admitted_inpatient"] = df["admitted_inpatient"].map({"In": "inpatient", "In patient": "inpatient","inpatient": "inpatient","outpatient": "outpatient","out-patient": "outpatient"}).fillna("missing")
+                        
             for col in ["onset_date"]:
                 if col in df.columns and df[col].dtype == 'object':
                     df[col] = df[col].astype(str)
@@ -395,99 +374,7 @@ def csm_pipeline():
             return df.to_dict("records")
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
-    # -------------------------
-    # Validation
-    # -------------------------
-    # @task
-    # def validate_data(records, **context):
-    #     conn = None
-    #     try:
-    #         if not records:
-    #             return []
-            
-    #         df = pd.DataFrame(records)
-    #         dag_run = context["dag_run"]   
-    #         ti = context["task_instance"]     
-    #       #  valid_rows = []
-    #         failures = []
-            
-    #         for idx, row in df.iterrows():
-    #             try:
-    #                 age = pd.to_numeric(row.get("age"), errors="coerce")
 
-    #                 if pd.isna(row.get("state")) and pd.isna(row.get("lga")):
-    #                     failures.append((int(idx),"Missing location",dag_run.run_id, ti.dag_id))
-
-    #                 elif pd.isna(age) or age < 0 or age > 120: 
-    #                     failures.append((int(idx),"Invalid age",dag_run.run_id, ti.dag_id))
-
-    #                 elif pd.isna(row.get("epid_number")):
-    #                     failures.append((int(idx),"Missing Epid number",dag_run.run_id, ti.dag_id))
-    #                 else:
-    #                     pass
-    #                    # valid_rows.append(row)
-    #             except Exception as row_error:
-    #                 print(f"Row {idx} failed with error: {row_error}")
-    #                 failures.append((int(idx),f"Row processing error: {str(row_error)}",dag_run.run_id, ti.dag_id))
-    #         if failures:
-    #             try:
-    #                 hook = PostgresHook(postgres_conn_id=dw_conn_id)
-    #                 conn = hook.get_conn()
-    #                 cur = conn.cursor()
-    #                 cur.executemany("""
-    #                 INSERT INTO etl_validation_failures
-    #                 (row_number,failure_reason, run_id, dag_id)
-    #                 VALUES (%s,%s,%s,%s)
-    #                 """, failures)
-    #                 conn.commit()
-    #             except Exception as db_error:
-    #                 print(f"DB Error inserting validation failures: {str(db_error)}")
-    #                 if conn:
-    #                     conn.rollback()
-    #                 raise Exception(f"Error inserting validation failures: {str(db_error)}") from db_error
-    #             finally:
-    #                 if conn:
-    #                     try:
-    #                         conn.close()
-    #                     except:
-    #                         pass
-
-    #         df_valid = make_xcom_safe(df)
-            
-    #         return df_valid.to_dict("records")
-            
-            
-    #     except Exception as e:
-    #         print(f"CRITICAL ERROR in validate_data: {str(e)}")
-    #         raise Exception(f"Error in validate_data: {str(e)}") from e
-
-
-    # # -------------------------
-    # # Deduplication
-    # # -------------------------
-    # @task
-    # def deduplicate(records):
-    #     try:
-    #         if not records:
-    #             print("WARNING: deduplicate received empty list, returning empty")
-    #             return []
-            
-    #         df = pd.DataFrame(records)
-            
-    #         if "epid_number" in df.columns:
-    #             df = df.drop_duplicates(subset=["epid_number"])
-    #         else:
-    #             df = df.drop_duplicates()
-
-    #         return make_xcom_safe(df).to_dict("records")
-    #     except Exception as e:
-    #         print(f"CRITICAL ERROR in deduplicate: {str(e)}")
-    #         raise Exception(f"Error in deduplicate: {str(e)}") from e
-
-
-    # -------------------------
-    # Dimension Resolution
-    # -------------------------
     @task
     def resolve_dimensions(records):
         try:
@@ -543,48 +430,15 @@ def csm_pipeline():
             raise Exception(f"Error in resolve_dimensions: {str(e)}") from e
 
 
-    # -------------------------
-    # Case Versioning
-    # -------------------------
-    # @task
-    # def apply_case_versioning(records):
-    #     try:
-    #         if not records:
-    #             print("WARNING: apply_case_versioning received empty list, returning empty")
-    #             return []
-            
-    #         df = pd.DataFrame(records)
-    #         dw = PostgresHook(postgres_conn_id=dw_conn_id)
-
-    #         try:
-    #             existing = dw.get_pandas_df("SELECT epid_number, MAX(case_version) AS version FROM core_case_fact GROUP BY epid_number")
-    #         except Exception as query_error:
-    #             print(f"Warning: Could not query existing case versions: {str(query_error)}")
-    #             existing = None
-            
-    #         if existing is None or existing.empty:
-    #             existing = pd.DataFrame(columns=["epid_number", "version"])
-            
-    #         if "epid_number" in df.columns:
-    #             df = df.merge(existing, on="epid_number", how="left")
-            
-    #         df["case_version"] = df["version"].fillna(0) + 1
-    #         df = df.convert_dtypes()
-    #         df = df.where(pd.notnull(df), None)
-
-    #         return make_xcom_safe(df).to_dict("records")
-    #     except Exception as e:
-    #         print(f"CRITICAL ERROR in apply_case_versioning: {str(e)}")
-    #         raise Exception(f"Error in apply_case_versioning: {str(e)}") from e
-
-    # -------------------------
-    # Bulk Load
-    # -------------------------
     @task
     def load_csm_data(records):
         conn = None
         cur = None
         try:
+            hook = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = hook.get_conn()
+            cur = conn.cursor()
+
             if not records:
                 print("WARNING: load_csm_data received empty list, returning empty DataFrame")
                 return []
@@ -602,21 +456,16 @@ def csm_pipeline():
             fact_df = df[required_cols].copy()
             fact_df.columns = ["disease_id", "onset_date", "lga_id", "state_id", "case_classification", "outcome"]
             
-            hook = PostgresHook(postgres_conn_id=dw_conn_id)
-            conn = hook.get_conn()
-            cur = conn.cursor()
-
             cur.execute("""
-            CREATE TEMP TABLE tmp_core_case_fact (
-                CREATE TEMP TABLE tmp_core_surveillance_fact (
+                        CREATE TEMP TABLE tmp_core_surveillance_fact (
                             disease_id INT,
                             onset_date DATE,
                             lga_id INT, 
                             state_id INT,
                             case_classification VARCHAR(50),
                             outcome VARCHAR(50)
-            ) ON COMMIT DROP
-            """)
+                        ) ON COMMIT DROP
+                        """)
             
             buffer = io.StringIO()
             fact_df.to_csv(buffer, index=False, header=False)
