@@ -1,8 +1,9 @@
 import os
-from airflow.decorators import dag, task
+from airflow.sdk import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.task.trigger_rule import TriggerRule
 from airflow.models import DagRun
+from airflow.exceptions import AirflowSkipException
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -10,6 +11,7 @@ import io
 import json
 import re 
 from difflib import SequenceMatcher
+import tempfile
 
 DAG_ID = "influenza_linelist_pipeline"
 staging_conn_id = "staging_postgres_db"
@@ -49,20 +51,6 @@ def log_task_failure(context):
         import traceback
         traceback.print_exc()
 
-# Return XCom safe data by converting datetimes to strings and ensuring all data is JSON serializable
-def make_xcom_safe(df):
-    df = df.copy()
-    for col in df.columns:
-        # Convert datetime/date columns to string
-        if "datetime" in str(df[col].dtype) or df[col].dtype == "object":
-            df[col] = df[col].apply(
-                lambda x: x.isoformat() if hasattr(x, "isoformat") else x
-            )
-
-    # Replace NaN / NaT with None
-    df = df.replace({np.nan: None})
-
-    return df
 
 DAG_DIR = os.path.dirname(os.path.abspath(__file__))
 COLUMN_MAPPING_FILE = os.path.join(DAG_DIR, "column_mappings.json")
@@ -241,7 +229,19 @@ def influenza_pipeline():
                 else:
                     count = check.iloc[0][0]
                     if count > 0:
-                        return []
+                        cur = conn.cursor()
+                        cur.execute("""
+                                UPDATE etl_run_log
+                                SET end_time = NOW(),
+                                    file_name = %s,
+                                    status=%s,
+                                    records_extracted = %s,
+                                    records_loaded = %s       
+                                WHERE run_id=%s
+                            """, (file_name,'SKIPPED', 0, 0, started))
+                        
+                        conn.commit()  
+                        raise AirflowSkipException(f"File {file_name} has already been processed")
                     else:
                         full_path = os.path.join(BASE_DIR, stored_path)
                         root, file_ext = os.path.splitext(file_name)
@@ -256,12 +256,32 @@ def influenza_pipeline():
                             cur = conn.cursor()
                             cur.execute("""
                                     UPDATE etl_run_log
-                                    SET file_name = %s        
+                                    SET file_name = %s,
+                                        records_extracted = %s        
                                     WHERE run_id=%s
-                                """, (file_name, started))
+                                """, (file_name, len(line_list_data), started))
                             
-                            conn.commit()
-                            return make_xcom_safe(line_list_data).to_dict("records")
+                            conn.commit()       
+
+                            tmp_file = tempfile.NamedTemporaryFile(
+                                suffix=".parquet",
+                                prefix=f"influenza_{started}_",
+                                delete=False
+                            )
+                            object_cols = line_list_data.select_dtypes(include=["object"]).columns
+
+                            for col in object_cols:
+                                line_list_data[col] = line_list_data[col].astype(str)
+                           
+                            line_list_data.to_parquet(tmp_file.name, index=False)
+
+                            return {
+                                "run_id": started,
+                                "path": tmp_file.name,
+                                "rows": len(line_list_data)
+                            }
+        except AirflowSkipException:
+            raise
         except Exception as e:
             raise Exception(f"Error in extract data from the staging db: {str(e)}") from e
 
@@ -270,22 +290,21 @@ def influenza_pipeline():
         try:
             if not records:
                 return []
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
 
-            required_columns = ["Epid Week", "Local Government", "State of Resident", "Outcome", "Year", ]
+            required_columns = ["Epid Week", "Local Government", "State of Resident", "Year", ]
             df = apply_column_mapping(df, required_columns=required_columns, fuzzy_threshold=85)
 
             df.replace("null", pd.NA, inplace=True)
+            df.columns = df.columns.str.lower()
 
-            if "result_intepretation_positive_negative_or_rejected" in df.columns:
-                df["result_intepretation_positive_negative_or_rejected"] = df["result_intepretation_positive_negative_or_rejected"].map({"Positive": "positive", "Negative": "negative"}).fillna("missing")
+            if "influenza type" in df.columns:
+                df["case_classification"] = np.where(df["influenza type"].isin(["Flu A", "Flu B"]), "confirmed",
+                                            np.where(df["influenza type"].isna(), "missing", "suspected"))
 
-                df["case_classification"] = np.where(df["result_intepretation_positive_negative_or_rejected"] == "positive", "confirmed",
-                                            np.where(df["result_intepretation_positive_negative_or_rejected"].isna(), "missing", "suspected"))
-
-
-
-            return df.to_dict("records")
+            df.to_parquet(records["path"], index=False)
+            return records
+           
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
 
@@ -296,7 +315,7 @@ def influenza_pipeline():
                 print("WARNING: resolve_dimensions received empty list, returning empty")
                 return []
             
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
             dw = PostgresHook(postgres_conn_id=dw_conn_id)
 
             states = dw.get_pandas_df("SELECT state_id,state_name FROM master_state")
@@ -308,15 +327,17 @@ def influenza_pipeline():
                 raise Exception("No LGAs found in master_lga table")
 
             if "state" in df.columns:
-                df["state"] = df["state"].str.strip().str.lower()
-                states["state_name"] = states["state_name"].str.strip().str.lower()
+                df["state"] = df["state"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
+                df["state"] = df["state"].map({"fct": "federalcapitalterritory"}).fillna(df["state"])
+                states["state_name"] = states["state_name"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
                 df = df.merge(states, left_on="state", right_on="state_name", how="left")
             else:
                 raise Exception("Missing 'state' column in data")
 
             if "lga" in df.columns and "state_id" in df.columns:
-                df["lga"] = df["lga"].str.strip().str.lower()
-                lgas["lga_name"] = lgas["lga_name"].str.strip().str.lower()
+                df["lga"] = df["lga"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
+                df["lga"] = df["lga"].map({"kirikasamma": "kirikasama","wamakko":"wamako","nassarawa":"nasarawa","birninmagaji":"birninmagajikiyaw","ileshaeast":"ilesaeast","ileshawest":"ilesawest"}).fillna(df["lga"])
+                lgas["lga_name"] = lgas["lga_name"].str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip().str.lower()
                 df = df.merge(lgas, left_on=["lga", "state_id"], right_on=["lga_name", "state_id"], how="left")
             else:
                 raise Exception("Missing 'lga' or 'state_id' column in data")
@@ -331,8 +352,8 @@ def influenza_pipeline():
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
-                   
-            return make_xcom_safe(df).to_dict("records")
+            df.to_parquet(records["path"], index=False)       
+            return records
         except Exception as e:
             print(f"CRITICAL ERROR in resolve_dimensions: {str(e)}")
             raise Exception(f"Error in resolve_dimensions: {str(e)}") from e
@@ -342,15 +363,19 @@ def influenza_pipeline():
         conn = None
         cur = None
         try:
+            hook = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = hook.get_conn()
+            cur = conn.cursor()
+
             if not records:
                 print("WARNING: load_influenza_data received empty list, returning empty DataFrame")
                 return []
             
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
 
             for col in ["lga_id", "state_id","epi_week","epi_year"]:
                 if col in df.columns:
-                    df[col] = df[col].astype("Int64")
+                    df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
             
             required_cols = ["disease_id", "lga_id", "state_id","case_classification","epi_week","epi_year"]
             missing_cols = [col for col in required_cols if col not in df.columns]
@@ -359,10 +384,6 @@ def influenza_pipeline():
             
             fact_df = df[required_cols].copy()
             fact_df.columns = ["disease_id", "lga_id", "state_id", "case_classification","epi_week","epi_year"]
-            
-            hook = PostgresHook(postgres_conn_id=dw_conn_id)
-            conn = hook.get_conn()
-            cur = conn.cursor()
 
             cur.execute("""
                         CREATE TEMP TABLE tmp_core_surveillance_fact (
@@ -402,7 +423,7 @@ def influenza_pipeline():
                             ELSE 0 
                         END
                     ) AS confirmed,
-                    '' AS deaths
+                    0 AS deaths
                 FROM tmp_core_surveillance_fact c
                 JOIN master_disease d ON c.disease_id = d.disease_id
                 LEFT JOIN master_state s ON c.state_id = s.state_id
@@ -435,43 +456,52 @@ def influenza_pipeline():
                     conn.close()
                 except:
                     pass
-   
+    
     @task(trigger_rule=TriggerRule.ALL_DONE)
-    def end_run(records, loaded_cases, etl_run_id, **context):
+    def cleanup_temp(records):
+
+        try:
+            if records and os.path.exists(records["path"]):
+                os.remove(records["path"])
+        except Exception as e:
+            print(f"Cleanup warning: {e}")
+
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def end_run(loaded_cases, etl_run_id, **context):
         conn = None
         cur = None
         try:
-            extracted_count = len(records) if records else 0
-            if loaded_cases:
+            loaded_count = len(loaded_cases) if loaded_cases else 0
 
-                hook = PostgresHook(postgres_conn_id=dw_conn_id)
-                conn = hook.get_conn()
-                cur = conn.cursor()
+            hook = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = hook.get_conn()
+            cur = conn.cursor()
 
-                try:
-                    cur.execute("""
-                        SELECT COUNT(*)
-                        FROM etl_task_failures
-                        WHERE run_id = %s
-                    """, (context.get("run_id", etl_run_id),))
-                    
-                    result = cur.fetchone()
-                    failure_count = result[0] if result else 0
-                except Exception as query_error:
-                    print(f"Warning: Could not query task failures: {str(query_error)}")
-                    failure_count = 0
-
-                status = "FAILED" if failure_count > 0 else "SUCCESS"
-                
+            try:
                 cur.execute("""
-                    UPDATE etl_run_log
-                    SET end_time = NOW(),
-                        status=%s,
-                        records_extracted = %s          
-                    WHERE run_id=%s
-                """, (status, extracted_count, etl_run_id))
+                    SELECT COUNT(*)
+                    FROM etl_task_failures
+                    WHERE run_id = %s
+                """, (context.get("run_id", etl_run_id),))
+                
+                result = cur.fetchone()
+                failure_count = result[0] if result else 0
+            except Exception as query_error:
+                print(f"Warning: Could not query task failures: {str(query_error)}")
+                failure_count = 0
+            
+            status = "FAILED" if failure_count > 0 else "SUCCESS"
 
-                conn.commit()
+            cur.execute("""
+                UPDATE etl_run_log
+                SET end_time = NOW(),
+                    status=%s,
+                    records_loaded = %s
+                WHERE run_id=%s and status = 'running'
+            """, (status, loaded_count, etl_run_id))
+
+            conn.commit()        
+       
         except Exception as e:
             if conn:
                 conn.rollback()
@@ -489,16 +519,14 @@ def influenza_pipeline():
     # DAG dependency flow
 
     run = start_run()
-
     records = extract_data(run)
-
     cleaned = clean_data(records)
-
     resolved = resolve_dimensions(cleaned)
-
     loaded_data = load_influenza_data(resolved)
+    cleaned = cleanup_temp(resolved)
+    loaded_data >> cleaned
 
-    end_run(records, loaded_data, run )
-
+    end = end_run(loaded_data, run )
+    cleaned >> end
 
 influenza_pipeline()

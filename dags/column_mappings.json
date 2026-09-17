@@ -9,7 +9,8 @@
         "date of symptom onset",
         "date symptom started",
         "date symptoms began",
-        "illness onset date"
+        "illness onset date",
+        "Date of symptom onset (dd/MM/yyyy)"
     ],
     "report_date": [
         "report date",

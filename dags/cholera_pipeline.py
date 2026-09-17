@@ -1,15 +1,16 @@
-from airflow.decorators import dag, task
+import os
+from airflow.sdk import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.utils.trigger_rule import TriggerRule
-from airflow.models import DagRun
+from airflow.task.trigger_rule import TriggerRule
+from airflow.exceptions import AirflowSkipException
 from datetime import datetime
 import pandas as pd
 import numpy as np
 import io
-import os
 import json
 import re 
 from difflib import SequenceMatcher
+import tempfile
 
 DAG_ID = "cholera_linelist_pipeline"
 staging_conn_id = "staging_postgres_db"
@@ -48,21 +49,6 @@ def log_task_failure(context):
         print(f"CRITICAL: Error logging task failure to DB: {e}")
         import traceback
         traceback.print_exc()
-
-# Return XCom safe data by converting datetimes to strings and ensuring all data is JSON serializable
-def make_xcom_safe(df):
-    df = df.copy()
-    for col in df.columns:
-        # Convert datetime/date columns to string
-        if "datetime" in str(df[col].dtype) or df[col].dtype == "object":
-            df[col] = df[col].apply(
-                lambda x: x.isoformat() if hasattr(x, "isoformat") else x
-            )
-
-    # Replace NaN / NaT with None
-    df = df.replace({np.nan: None})
-
-    return df
 
 DAG_DIR = os.path.dirname(os.path.abspath(__file__))
 COLUMN_MAPPING_FILE = os.path.join(DAG_DIR, "column_mappings.json")
@@ -241,7 +227,19 @@ def cholera_pipeline():
                 else:
                     count = check.iloc[0][0]
                     if count > 0:
-                        return []
+                        cur = conn.cursor()
+                        cur.execute("""
+                                UPDATE etl_run_log
+                                SET end_time = NOW(),
+                                    file_name = %s,
+                                    status=%s,
+                                    records_extracted = %s,
+                                    records_loaded = %s       
+                                WHERE run_id=%s
+                            """, (file_name,'SKIPPED', 0, 0, started))
+                        
+                        conn.commit()  
+                        raise AirflowSkipException(f"File {file_name} has already been processed")
                     else:
                         full_path = os.path.join(BASE_DIR, stored_path)
                         root, file_ext = os.path.splitext(file_name)
@@ -256,12 +254,31 @@ def cholera_pipeline():
                             cur = conn.cursor()
                             cur.execute("""
                                     UPDATE etl_run_log
-                                    SET file_name = %s        
+                                    SET file_name = %s,
+                                        records_extracted = %s        
                                     WHERE run_id=%s
-                                """, (file_name, started))
+                                """, (file_name, len(line_list_data), started))
                             
                             conn.commit()
-                            return make_xcom_safe(line_list_data).to_dict("records")
+                            tmp_file = tempfile.NamedTemporaryFile(
+                                suffix=".parquet",
+                                prefix=f"cholera_{started}_",
+                                delete=False
+                            )
+                            object_cols = line_list_data.select_dtypes(include=["object"]).columns
+
+                            for col in object_cols:
+                                line_list_data[col] = line_list_data[col].astype(str)
+                           
+                            line_list_data.to_parquet(tmp_file.name, index=False)
+
+                            return {
+                                "run_id": started,
+                                "path": tmp_file.name,
+                                "rows": len(line_list_data)
+                            }
+        except AirflowSkipException:
+            raise
         except Exception as e:
             raise Exception(f"Error in extract data from the staging db: {str(e)}") from e
 
@@ -270,8 +287,7 @@ def cholera_pipeline():
         try:
             if not records:
                 return []
-            df = pd.DataFrame(records)
-
+            df = pd.read_parquet(records["path"])
             required_columns = ["Epid Week", "Local Government", "Date of report", "State of Resident", "Outcome"]
             df = apply_column_mapping(df, required_columns=required_columns, fuzzy_threshold=85)
 
@@ -295,93 +311,12 @@ def cholera_pipeline():
                     )
                 )
             
-            return df.to_dict("records")
+            df.to_parquet(records["path"], index=False)
+            return records
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
 
-    # @task
-    # def validate_data(records, **context):
-    #     conn = None
-    #     try:
-    #         if not records:
-    #             return []
-            
-    #         df = pd.DataFrame(records)
-    #         dag_run = context["dag_run"]   
-    #         ti = context["task_instance"]     
-
-    #        # valid_rows = []
-    #         failures = []
-            
-    #         for idx, row in df.iterrows():
-    #             try:
-    #                 age = pd.to_numeric(row.get("age"), errors="coerce")
-
-    #                 if pd.isna(row.get("state")) and pd.isna(row.get("lga")):
-    #                     failures.append((int(idx),"Missing location",dag_run.run_id, ti.dag_id))
-
-    #                 elif pd.isna(age) or age < 0 or age > 120: 
-    #                     failures.append((int(idx),"Invalid age",dag_run.run_id, ti.dag_id))
-
-    #                 elif pd.isna(row.get("epid_number")):
-    #                     failures.append((int(idx),"Missing Epid number",dag_run.run_id, ti.dag_id))
-    #                 else:
-    #                     # valid_rows.append(row)
-    #                     pass
-    #             except Exception as row_error:
-    #                 print(f"Row {idx} failed with error: {row_error}")
-    #                 failures.append((int(idx),f"Row processing error: {str(row_error)}",dag_run.run_id, ti.dag_id))
-    #         if failures:
-    #             try:
-    #                 hook = PostgresHook(postgres_conn_id=dw_conn_id)
-    #                 conn = hook.get_conn()
-    #                 cur = conn.cursor()
-    #                 cur.executemany("""
-    #                 INSERT INTO etl_validation_failures
-    #                 (row_number,failure_reason, run_id, dag_id)
-    #                 VALUES (%s,%s,%s,%s)
-    #                 """, failures)
-    #                 conn.commit()
-    #             except Exception as db_error:
-    #                 print(f"DB Error inserting validation failures: {str(db_error)}")
-    #                 if conn:
-    #                     conn.rollback()
-    #                 raise Exception(f"Error inserting validation failures: {str(db_error)}") from db_error
-    #             finally:
-    #                 if conn:
-    #                     try:
-    #                         conn.close()
-    #                     except:
-    #                         pass
-
-    #         df_valid = make_xcom_safe(df)
-            
-    #         return df_valid.to_dict("records")
-            
-            
-    #     except Exception as e:
-    #         print(f"CRITICAL ERROR in validate_data: {str(e)}")
-    #         raise Exception(f"Error in validate_data: {str(e)}") from e
-
-    # @task
-    # def deduplicate(records):
-
-    #     try:
-    #         if not records:
-    #             print("WARNING: deduplicate received empty list, returning empty")
-    #             return []
-            
-    #         df = pd.DataFrame(records)
-            
-    #         if "epid_number" in df.columns:
-    #             df = df.drop_duplicates(subset=["epid_number"])
-    #         else:
-    #             df = df.drop_duplicates()
-
-    #         return make_xcom_safe(df).to_dict("records")
-    #     except Exception as e:
-    #         print(f"CRITICAL ERROR in deduplicate: {str(e)}")
-    #         raise Exception(f"Error in deduplicate: {str(e)}") from e
+    
 
     @task
     def resolve_dimensions(records):
@@ -390,7 +325,7 @@ def cholera_pipeline():
                 print("WARNING: resolve_dimensions received empty list, returning empty")
                 return []
             
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
             dw = PostgresHook(postgres_conn_id=dw_conn_id)
 
             states = dw.get_pandas_df("SELECT state_id,state_name FROM master_state")
@@ -432,107 +367,14 @@ def cholera_pipeline():
                     df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
                    
-            return make_xcom_safe(df).to_dict("records")
+            df.to_parquet(records["path"], index=False)       
+            return records
         except Exception as e:
             print(f"CRITICAL ERROR in resolve_dimensions: {str(e)}")
             raise Exception(f"Error in resolve_dimensions: {str(e)}") from e
     
 
     
-    #     conn = None
-    #     cur = None
-    #     try:
-    #         if inserted_cases_df is None:
-    #             return 0
-            
-    #         df = pd.DataFrame(records)
-    #         inserted_cases = pd.DataFrame(inserted_cases_df)
-            
-    #         if "epid_number" not in df.columns or "epid_number" not in inserted_cases.columns:
-    #             raise Exception("Missing epid_number column for merge")
-            
-    #         df = df.merge(inserted_cases, on="epid_number", how="inner")
-            
-    #         if df.empty:
-    #             raise Exception("No matching records after merge with inserted cases")
-            
-    #         required_cols = [
-    #             "case_fact_id",
-    #             "date_seen_at_hf",
-    #             "samplestaken",
-    #             "labresults_rdt",
-    #             "labresults_cul",
-    #             "level_of_hydration",
-    #             "datasource",
-    #             "tests"
-    #         ]
-            
-    #         available_cols = [col for col in required_cols if col in df.columns]
-    #         if not available_cols:
-    #             raise Exception(f"None of the required columns found in data")
-            
-    #         cholera_df = df[available_cols].copy()
-            
-    #         hook = PostgresHook(postgres_conn_id=dw_conn_id)
-    #         conn = hook.get_conn()
-    #         cur = conn.cursor()
-
-    #         buffer = io.StringIO()
-    #         cholera_df.to_csv(buffer, index=False, header=False)
-    #         buffer.seek(0)
-
-    #         cur.execute("""
-    #         CREATE TEMP TABLE tmp_ext_cholera_case (
-    #             case_id INT,
-    #             date_seen_at_hf DATE,
-    #             samples_taken BOOLEAN,
-    #             labresult_rdt VARCHAR(50),
-    #             labresult_cul VARCHAR(50),
-    #             level_of_hydration VARCHAR(50),
-    #             datasource VARCHAR(100),
-    #             tests BOOLEAN
-    #         ) ON COMMIT DROP
-    #         """)
-            
-    #         cur.copy_expert("""
-    #         COPY tmp_ext_cholera_case
-    #         (case_id,date_seen_at_hf,samples_taken,labresult_rdt,
-    #         labresult_cul,level_of_hydration,datasource,tests)
-    #         FROM STDIN WITH CSV
-    #         """, buffer)
-
-    #         cur.execute("""
-    #         INSERT INTO ext_cholera_case
-    #         (case_id,date_seen_at_hf,samples_taken,labresult_rdt,
-    #         labresult_cul,level_of_hydration,datasource,tests)
-    #         SELECT case_id,date_seen_at_hf,samples_taken,labresult_rdt,
-    #             labresult_cul,level_of_hydration,datasource,tests
-    #         FROM tmp_ext_cholera_case
-    #         ON CONFLICT (case_id) DO UPDATE
-    #         SET
-    #             date_seen_at_hf = EXCLUDED.date_seen_at_hf,
-    #             samples_taken = EXCLUDED.samples_taken,
-    #             labresult_rdt = EXCLUDED.labresult_rdt,
-    #             labresult_cul = EXCLUDED.labresult_cul,
-    #             level_of_hydration = EXCLUDED.level_of_hydration,
-    #             datasource = EXCLUDED.datasource,
-    #             tests = EXCLUDED.tests
-    #         """)
-            
-    #         conn.commit()
-    #         return len(inserted_cases)
-    #     except Exception as e:
-    #         if conn:
-    #             conn.rollback()
-    #         raise Exception(f"Error in loading cholera extension table: {str(e)}") from e
-    #     finally:
-    #         if conn:
-    #             try:
-    #                 if cur:
-    #                     cur.close()
-    #                 conn.close()
-    #             except:
-    #                 pass
 
     @task
     def load_cholera_data(records):
@@ -545,7 +387,7 @@ def cholera_pipeline():
                 print("WARNING: load_cholera_data received empty list, returning empty DataFrame")
                 return []
             
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
 
             for col in ["lga_id", "state_id"]:
                 if col in df.columns:
@@ -639,45 +481,51 @@ def cholera_pipeline():
                 except:
                     pass
 
-    # # -------------------------
-    # Run Logging - End
-    # -------------------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
-    def end_run(records, loaded_data, etl_run_id, **context):
+    def cleanup_temp(records):
+
+        try:
+            if records and os.path.exists(records["path"]):
+                os.remove(records["path"])
+        except Exception as e:
+            print(f"Cleanup warning: {e}")
+
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def end_run(loaded_cases, etl_run_id, **context):
         conn = None
         cur = None
         try:
-            extracted_count = len(records) if records else 0
-            if loaded_data:
+            loaded_count = len(loaded_cases) if loaded_cases else 0
 
-                hook = PostgresHook(postgres_conn_id=dw_conn_id)
-                conn = hook.get_conn()
-                cur = conn.cursor()
+            hook = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = hook.get_conn()
+            cur = conn.cursor()
 
-                try:
-                    cur.execute("""
-                        SELECT COUNT(*)
-                        FROM etl_task_failures
-                        WHERE run_id = %s
-                    """, (context.get("run_id", etl_run_id),))
-                    
-                    result = cur.fetchone()
-                    failure_count = result[0] if result else 0
-                except Exception as query_error:
-                    print(f"Warning: Could not query task failures: {str(query_error)}")
-                    failure_count = 0
-
-                status = "FAILED" if failure_count > 0 else "SUCCESS"
-                
+            try:
                 cur.execute("""
-                    UPDATE etl_run_log
-                    SET end_time = NOW(),
-                        status=%s,
-                        records_extracted = %s          
-                    WHERE run_id=%s
-                """, (status, extracted_count, etl_run_id))
+                    SELECT COUNT(*)
+                    FROM etl_task_failures
+                    WHERE run_id = %s
+                """, (context.get("run_id", etl_run_id),))
+                
+                result = cur.fetchone()
+                failure_count = result[0] if result else 0
+            except Exception as query_error:
+                print(f"Warning: Could not query task failures: {str(query_error)}")
+                failure_count = 0
+            
+            status = "FAILED" if failure_count > 0 else "SUCCESS"
 
-                conn.commit()
+            cur.execute("""
+                UPDATE etl_run_log
+                SET end_time = NOW(),
+                    status=%s,
+                    records_loaded = %s
+                WHERE run_id=%s and status = 'running'
+            """, (status, loaded_count, etl_run_id))
+
+            conn.commit()        
+       
         except Exception as e:
             if conn:
                 conn.rollback()
@@ -695,16 +543,13 @@ def cholera_pipeline():
     # DAG dependency flow
 
     run = start_run()
-
-    records = extract_data(run)
-    
+    records = extract_data(run)    
     cleaned_data = clean_data(records)
-
     resolved = resolve_dimensions(cleaned_data)
-
     loaded_data =load_cholera_data(resolved)
-
-    end_run(records, loaded_data, run )
-
+    cleaned = cleanup_temp(resolved)
+    loaded_data >> cleaned
+    end = end_run(loaded_data, run )
+    cleaned >> end
 
 cholera_pipeline()

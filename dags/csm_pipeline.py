@@ -1,83 +1,17 @@
-from airflow.decorators import dag, task
+import os
+from airflow.sdk import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.task.trigger_rule import TriggerRule
 from airflow.models import DagRun
+from airflow.exceptions import AirflowSkipException
 from datetime import datetime
 import pandas as pd
 import numpy as np
 import io
-import re
-import os
 import json
+import re 
 from difflib import SequenceMatcher
-
-# def clean_date_columns(df, date_cols, return_report=True):
-
-#     def parse_excel_serial(x):
-#         try:
-#             val = float(x)
-#             if val > 10000:  # heuristic threshold
-#                 return pd.to_datetime(val, origin='1899-12-30', unit='D')
-#         except:
-#             pass
-#         return None
-
-#     def parse_mixed_date(x):
-#         if pd.isna(x):
-#             return pd.NaT
-
-#         x = str(x).strip()
-
-#         # Remove unwanted characters
-#         x = re.sub(r'[^0-9/\-]', '', x)
-
-#         # Try Excel serial
-#         serial = parse_excel_serial(x)
-#         if serial is not None:
-#             return serial
-
-#         # Heuristic for dd/mm vs mm/dd
-#         try:
-#             parts = re.split(r'[/-]', x)
-#             if len(parts) == 3:
-#                 p1, p2, _ = parts
-#                 if int(p1) > 12:
-#                     return pd.to_datetime(x, dayfirst=True, errors='coerce')
-#                 elif int(p2) > 12:
-#                     return pd.to_datetime(x, dayfirst=False, errors='coerce')
-#         except:
-#             pass
-
-#         # Fallback
-#         return pd.to_datetime(x, format='mixed', errors='coerce')
-
-#     report = {}
-
-#     for col in date_cols:
-#         # Force to string to avoid mixed dtype issues
-#         df[col] = df[col].astype(str)
-
-#         cleaned_col = f"{col}_clean"
-
-#         df[cleaned_col] = df[col].apply(parse_mixed_date)
-
-#         # Data quality metrics
-#         total = len(df)
-#         nulls = df[cleaned_col].isna().sum()
-
-#         report[col] = {
-#             "total_rows": total,
-#             "invalid_dates": int(nulls),
-#             "valid_dates": int(total - nulls),
-#             "invalid_pct": round(nulls / total * 100, 2)
-#         }
-
-#     if return_report:
-#         return df, report
-
-#     return df
-
-
+import tempfile
 
 DAG_ID = "csm_linelist_pipeline"
 staging_conn_id = "staging_postgres_db"
@@ -116,21 +50,6 @@ def log_task_failure(context):
         print(f"CRITICAL: Error logging task failure to DB: {e}")
         import traceback
         traceback.print_exc()
-
-# Return XCom safe data by converting datetimes to strings and ensuring all data is JSON serializable
-def make_xcom_safe(df):
-    df = df.copy()
-    for col in df.columns:
-        # Convert datetime/date columns to string
-        if "datetime" in str(df[col].dtype) or df[col].dtype == "object":
-            df[col] = df[col].apply(
-                lambda x: x.isoformat() if hasattr(x, "isoformat") else x
-            )
-
-    # Replace NaN / NaT with None
-    df = df.replace({np.nan: None})
-
-    return df
 
 DAG_DIR = os.path.dirname(os.path.abspath(__file__))
 COLUMN_MAPPING_FILE = os.path.join(DAG_DIR, "column_mappings.json")
@@ -316,7 +235,19 @@ def csm_pipeline():
                 else:
                     count = check.iloc[0][0]
                     if count > 0:
-                        return []
+                        cur = conn.cursor()
+                        cur.execute("""
+                                UPDATE etl_run_log
+                                SET end_time = NOW(),
+                                    file_name = %s,
+                                    status=%s,
+                                    records_extracted = %s,
+                                    records_loaded = %s       
+                                WHERE run_id=%s
+                            """, (file_name,'SKIPPED', 0, 0, started))
+                        
+                        conn.commit()  
+                        raise AirflowSkipException(f"File {file_name} has already been processed")
                     else:
                         full_path = os.path.join(BASE_DIR, stored_path)
                         root, file_ext = os.path.splitext(file_name)
@@ -331,12 +262,31 @@ def csm_pipeline():
                             cur = conn.cursor()
                             cur.execute("""
                                     UPDATE etl_run_log
-                                    SET file_name = %s        
+                                    SET file_name = %s,
+                                      records_extracted = %s            
                                     WHERE run_id=%s
-                                """, (file_name, started))
+                                """, (file_name, len(line_list_data),started))
                             
                             conn.commit()
-                            return make_xcom_safe(line_list_data).to_dict("records")
+                            tmp_file = tempfile.NamedTemporaryFile(
+                                suffix=".parquet",
+                                prefix=f"csm_{started}_",
+                                delete=False
+                            )
+                            object_cols = line_list_data.select_dtypes(include=["object"]).columns
+
+                            for col in object_cols:
+                                line_list_data[col] = line_list_data[col].astype(str)
+                           
+                            line_list_data.to_parquet(tmp_file.name, index=False)
+
+                            return {
+                                "run_id": started,
+                                "path": tmp_file.name,
+                                "rows": len(line_list_data)
+                            }
+        except AirflowSkipException:
+            raise
         except Exception as e:
             raise Exception(f"Error in extract data from the staging db: {str(e)}") from e
 
@@ -345,12 +295,13 @@ def csm_pipeline():
         try:
             if not records:
                 return []
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
 
             required_columns = ["State", "LGA", "Case classification", "Outcome", "Date of symptom onset (dd/MM/yyyy)"]
             df = apply_column_mapping(df, required_columns=required_columns, fuzzy_threshold=85)
 
             df.replace("null", pd.NA, inplace=True)
+            df.columns = df.columns.str.lower()
             
             if "age" in df.columns:
                 df["age"] = np.ceil(pd.to_numeric(df["age"], errors="coerce")).astype("Int64")
@@ -370,8 +321,8 @@ def csm_pipeline():
                 df["case_classification"] = np.where(df["result_positive_negative"] == "positive", "confirmed",
                                             np.where(df["result_positive_negative"].isna(), "missing", "suspected"))
 
-            df = make_xcom_safe(df)
-            return df.to_dict("records")
+            df.to_parquet(records["path"], index=False)
+            return records
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
 
@@ -382,7 +333,7 @@ def csm_pipeline():
                 print("WARNING: resolve_dimensions received empty list, returning empty")
                 return []
             
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
             dw = PostgresHook(postgres_conn_id=dw_conn_id)
 
             states = dw.get_pandas_df("SELECT state_id,state_name FROM master_state")
@@ -424,7 +375,8 @@ def csm_pipeline():
                     df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
                    
-            return make_xcom_safe(df).to_dict("records")
+            df.to_parquet(records["path"], index=False)       
+            return records
         except Exception as e:
             print(f"CRITICAL ERROR in resolve_dimensions: {str(e)}")
             raise Exception(f"Error in resolve_dimensions: {str(e)}") from e
@@ -442,7 +394,7 @@ def csm_pipeline():
             if not records:
                 print("WARNING: load_csm_data received empty list, returning empty DataFrame")
                 return []
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
 
             for col in ["lga_id", "state_id"]:
                 if col in df.columns:
@@ -533,151 +485,52 @@ def csm_pipeline():
                 except:
                     pass
 
-#     @task
-#     def load_csm_extension_table(records, inserted_cases_df):
-#         conn = None
-#         cur = None
-#         try:
-#             if not inserted_cases_df:
-#                 return 0
-            
-#             df = pd.DataFrame(records)
-#             inserted_cases = pd.DataFrame(inserted_cases_df)
-            
-#             if "epid_number" not in df.columns or "epid_number" not in inserted_cases.columns:
-#                 raise Exception("Missing epid_number column for merge")
-            
-#             df = df.merge(inserted_cases, on="epid_number", how="inner")
-            
-#             if df.empty:
-#                 raise Exception("No matching records after merge with inserted cases")
-            
-#             required_lassa_cols = [
-#                 "case_fact_id", "ward", "vaccination", "vaccinatedmen5doses_0_1_2_3","samplecollected_yes_no","result_positive_negative", "date_of_report_dd_mm_yyyy"
-#             ]
-            
-#             available_cols = [col for col in required_lassa_cols if col in df.columns]
-#             if not available_cols:
-#                 raise Exception(f"None of the required columns found in data")
-            
-#             lassa_df = df[available_cols].copy()
-            
-#             hook = PostgresHook(postgres_conn_id=dw_conn_id)
-#             conn = hook.get_conn()
-#             cur = conn.cursor()
-
-#             buffer = io.StringIO()
-#             lassa_df.to_csv(buffer, index=False, header=False)
-#             buffer.seek(0)
-
-#             cur.execute("""
-#             CREATE TEMP TABLE tmp_ext_csm_case (
-#                 case_id INT,                
-#                 ward VARCHAR(50),
-#                 vaccination_status VARCHAR(50),
-#                 vaccinated_men5doses VARCHAR(50),
-#                 sample_collected boolean,    
-#                 result_interpretation VARCHAR(50),                    
-#                 date_of_report date                      
-#             ) ON COMMIT DROP
-#             """)
-
-#                 # facility VARCHAR(100),
-#                 # case_classification VARCHAR(50),                
-#                 # first_symptom VARCHAR(50),                
-#                 # date_specimen_collected date,
-#                 # date_specimen_received_at_lab date,
-#                 # date_specimen_tested date,
-#                 # sodc VARCHAR(50),
-#                 # hpd VARCHAR(50),
-#                 # lyta VARCHAR(50),
-#                 # species VARCHAR(50),
-#                 # nma VARCHAR(50),
-#                 # nmb VARCHAR(50),
-#                 # nmc VARCHAR(50),
-#                 # nmw VARCHAR(50),
-#                 # nmx VARCHAR(50),
-#                 # nmy VARCHAR(50),
-#                 # hib VARCHAR(50),
-#                 # spn VARCHAR(50),
-#                 # final_intepretation VARCHAR(50),
-            
-#             cur.copy_expert("""
-#             COPY tmp_ext_csm_case (case_id, ward,vaccination_status,vaccinated_men5doses,
-#                 sample_collected,result_interpretation, date_of_report)
-#             FROM STDIN WITH CSV
-#             """, buffer)
-# # facility, case_classification,first_symptom,date_specimen_collected,date_specimen_received_at_lab,date_specimen_tested,sodc,hpd,
-#                 #lyta,species,nma,nmb,nmc,nmw,nmx,nmy,hib,spn,final_intepretation,
-#             cur.execute("""
-#             INSERT INTO ext_csm_case (case_id, ward,vaccination_status,vaccinated_men5doses,
-#                 sample_collected,result_interpretation,date_of_report)
-#             SELECT case_id, ward,vaccination_status,vaccinated_men5doses,
-#                 sample_collected,result_interpretation, date_of_report
-#             FROM tmp_ext_csm_case
-#             ON CONFLICT (case_id) DO UPDATE SET 
-#                         date_of_report = EXCLUDED.date_of_report,
-#                         ward = EXCLUDED.ward,
-#                         vaccination_status = EXCLUDED.vaccination_status,
-#                         vaccinated_men5doses = EXCLUDED.vaccinated_men5doses,
-#                         sample_collected = EXCLUDED.sample_collected,
-#                         result_interpretation = EXCLUDED.result_interpretation
-#             """)
-            
-#             conn.commit()
-#             return len(inserted_cases)
-#         except Exception as e:
-#             if conn:
-#                 conn.rollback()
-#             raise Exception(f"Error in load_csm_extension_table: {str(e)}") from e
-#         finally:
-#             if conn:
-#                 try:
-#                     if cur:
-#                         cur.close()
-#                     conn.close()
-#                 except:
-#                     pass
-
-#     # -------------------------
-    # Run Logging - End
-    # -------------------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
-    def end_run(records, loaded_cases, etl_run_id, **context):
+    def cleanup_temp(records):
+
+        try:
+            if records and os.path.exists(records["path"]):
+                os.remove(records["path"])
+        except Exception as e:
+            print(f"Cleanup warning: {e}")
+
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def end_run(loaded_cases, etl_run_id, **context):
         conn = None
         cur = None
         try:
-            extracted_count = len(records) if records else 0
-            if loaded_cases:
+            loaded_count = len(loaded_cases) if loaded_cases else 0
 
-                hook = PostgresHook(postgres_conn_id=dw_conn_id)
-                conn = hook.get_conn()
-                cur = conn.cursor()
+            hook = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = hook.get_conn()
+            cur = conn.cursor()
 
-                try:
-                    cur.execute("""
-                        SELECT COUNT(*)
-                        FROM etl_task_failures
-                        WHERE run_id = %s
-                    """, (context.get("run_id", etl_run_id),))
-                    
-                    result = cur.fetchone()
-                    failure_count = result[0] if result else 0
-                except Exception as query_error:
-                    print(f"Warning: Could not query task failures: {str(query_error)}")
-                    failure_count = 0
-
-                status = "FAILED" if failure_count > 0 else "SUCCESS"
-                
+            try:
                 cur.execute("""
+                    SELECT COUNT(*)
+                    FROM etl_task_failures
+                    WHERE run_id = %s
+                """, (context.get("run_id", etl_run_id),))
+                
+                result = cur.fetchone()
+                failure_count = result[0] if result else 0
+            except Exception as query_error:
+                print(f"Warning: Could not query task failures: {str(query_error)}")
+                failure_count = 0
+            
+            status = "FAILED" if failure_count > 0 else "SUCCESS"
+
+            cur.execute("""
                     UPDATE etl_run_log
                     SET end_time = NOW(),
                         status=%s,
-                        records_extracted = %s          
-                    WHERE run_id=%s
-                """, (status, extracted_count, etl_run_id))
+                        records_loaded = %s
+                    WHERE run_id=%s and status = 'running'
+                """, (status, loaded_count, etl_run_id))
 
             conn.commit()
+       
+                
         except Exception as e:
             if conn:
                 conn.rollback()
@@ -695,24 +548,13 @@ def csm_pipeline():
     # DAG dependency flow
 
     run = start_run()
-
     records = extract_data(run)
-
     cleaned = clean_data(records)
-
-    # validated = validate_data(cleaned)
-
-    # deduped = deduplicate(validated)
-
     resolved = resolve_dimensions(cleaned)
-
-    # versioned = apply_case_versioning(resolved)
-
-    # case_fact = load_core_fact_table(versioned)
-
     loaded_data =load_csm_data(resolved)
-
-    end_run(records, loaded_data, run )
-
+    cleaned = cleanup_temp(resolved)
+    loaded_data >> cleaned
+    end = end_run(loaded_data, run )
+    cleaned >> end
 
 csm_pipeline()
