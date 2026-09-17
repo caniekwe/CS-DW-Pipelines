@@ -1,8 +1,8 @@
 import os
-from airflow.decorators import dag, task
+from airflow.sdk import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.utils.trigger_rule import TriggerRule
-from airflow.models import DagRun
+from airflow.task.trigger_rule import TriggerRule
+from airflow.exceptions import AirflowSkipException
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -10,6 +10,7 @@ import io
 import json
 import re 
 from difflib import SequenceMatcher
+import tempfile
 
 
 DAG_ID = "lassaFever_linelist_pipeline"
@@ -50,20 +51,6 @@ def log_task_failure(context):
         import traceback
         traceback.print_exc()
 
-# Return XCom safe data by converting datetimes to strings and ensuring all data is JSON serializable
-def make_xcom_safe(df):
-    df = df.copy()
-    for col in df.columns:
-        # Convert datetime/date columns to string
-        if "datetime" in str(df[col].dtype) or df[col].dtype == "object":
-            df[col] = df[col].apply(
-                lambda x: x.isoformat() if hasattr(x, "isoformat") else x
-            )
-
-    # Replace NaN / NaT with None
-    df = df.replace({np.nan: None})
-
-    return df
 
 DAG_DIR = os.path.dirname(os.path.abspath(__file__))
 COLUMN_MAPPING_FILE = os.path.join(DAG_DIR, "column_mappings.json")
@@ -249,7 +236,19 @@ def lassa_pipeline():
                 else:
                     count = check.iloc[0][0]
                     if count > 0:
-                        return []
+                        cur = conn.cursor()
+                        cur.execute("""
+                                UPDATE etl_run_log
+                                SET end_time = NOW(),
+                                    file_name = %s,
+                                    status=%s,
+                                    records_extracted = %s,
+                                    records_loaded = %s       
+                                WHERE run_id=%s
+                            """, (file_name,'SKIPPED', 0, 0, started))
+                        
+                        conn.commit()  
+                        raise AirflowSkipException(f"File {file_name} has already been processed")
                     else:
                         full_path = os.path.join(BASE_DIR, stored_path)
                         root, file_ext = os.path.splitext(file_name)
@@ -269,7 +268,25 @@ def lassa_pipeline():
                                 """, (file_name, started))
                             
                             conn.commit()
-                            return make_xcom_safe(line_list_data).to_dict("records")
+                            tmp_file = tempfile.NamedTemporaryFile(
+                                suffix=".parquet",
+                                prefix=f"lassafever_{started}_",
+                                delete=False
+                            )
+                            object_cols = line_list_data.select_dtypes(include=["object"]).columns
+
+                            for col in object_cols:
+                                line_list_data[col] = line_list_data[col].astype(str)
+                           
+                            line_list_data.to_parquet(tmp_file.name, index=False)
+
+                            return {
+                                "run_id": started,
+                                "path": tmp_file.name,
+                                "rows": len(line_list_data)
+                            }
+        except AirflowSkipException:
+            raise
         except Exception as e:
             raise Exception(f"Error in extract data from the staging db: {str(e)}") from e
 
@@ -278,40 +295,13 @@ def lassa_pipeline():
         try:
             if not records:
                 return []
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
 
             required_columns = ["State", "LGA", "Result Intepretation (Positive, Negative or Rejected)", "Epi Week", "Epi Year"]
             df = apply_column_mapping(df, required_columns=required_columns, fuzzy_threshold=85)
 
             df.replace("null", pd.NA, inplace=True)
-            # if "caseid" in df.columns:
-            #     df.rename(columns={"caseid": "epid_number"}, inplace=True)
 
-            # if "age_years" in df.columns:
-            #     df["age_years"] = np.ceil(pd.to_numeric(df["age_years"], errors="coerce")).astype("Int64")
-            # if "age_months" in df.columns:
-            #     df["age_months"] = np.ceil(pd.to_numeric(df["age_months"], errors="coerce")/12).astype("Int64")
-            # if "age_days" in df.columns:
-            #     df["age_days"] = np.ceil(pd.to_numeric(df["age_days"], errors="coerce")/365).astype("Int64")
-            
-            # age_cols = [c for c in ["age_years", "age_months", "age_days"] if c in df.columns]
-            # if age_cols:
-            #     df["age"] = df[age_cols].bfill(axis=1).iloc[:, 0]
-
-            # if "gender" in df.columns:
-            #     df["gender"] = df["gender"].str.strip().str.lower()
-            #     df["gender"] = df["gender"].map({"m": "male", "f": "female"}).fillna("missing")
-
-            # for col in ["date_of_symptom_onset"]:
-            #     if col in df.columns and df[col].dtype == 'object':
-            #         df[col] = df[col].str.strip()
-            
-            # if "specimen_type" in df.columns:
-            #     df["specimen_type"] = df["specimen_type"].map({"Blood": "blood","Urine": "urine","Plasma": "plasma","Serum": "serum","Other":"other"}).fillna("missing")
-            
-            # for col in ["ct_value_qrt_pcr_i_target", "ct_value_qrt_pcr_ii_target"]:
-            #     if col in df.columns:
-            #         df[col] = df[col].fillna("missing")
             print("columns in df after cleaning:", df.columns.tolist())
             if "result" in df.columns:
                 df["result"] = df["result"].map({"Positive": "positive", "Negative": "negative"}).fillna("missing")
@@ -323,7 +313,8 @@ def lassa_pipeline():
             #     if col in df.columns:
             #         df[col] = pd.to_datetime(df[col], errors="coerce").dt.date.where(pd.to_datetime(df[col], errors="coerce").notna(), None)
 
-            return make_xcom_safe(df).to_dict("records")
+            df.to_parquet(records["path"], index=False)
+            return records
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
 
@@ -334,7 +325,7 @@ def lassa_pipeline():
                 print("WARNING: resolve_dimensions received empty list, returning empty")
                 return []
             
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
             dw = PostgresHook(postgres_conn_id=dw_conn_id)
 
             states = dw.get_pandas_df("SELECT state_id,state_name FROM master_state")
@@ -374,49 +365,14 @@ def lassa_pipeline():
                     df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
                    
-            return make_xcom_safe(df).to_dict("records")
+            df.to_parquet(records["path"], index=False)       
+            return records
         except Exception as e:
             print(f"CRITICAL ERROR in resolve_dimensions: {str(e)}")
             raise Exception(f"Error in resolve_dimensions: {str(e)}") from e
 
 
-    # -------------------------
-    # Case Versioning
-    # # -------------------------
-    # @task
-    # def apply_case_versioning(records):
-    #     try:
-    #         if not records:
-    #             print("WARNING: apply_case_versioning received empty list, returning empty")
-    #             return []
-            
-    #         df = pd.DataFrame(records)
-    #         dw = PostgresHook(postgres_conn_id=dw_conn_id)
-
-    #         try:
-    #             existing = dw.get_pandas_df("SELECT epid_number, MAX(case_version) AS version FROM core_case_fact GROUP BY epid_number")
-    #         except Exception as query_error:
-    #             print(f"Warning: Could not query existing case versions: {str(query_error)}")
-    #             existing = None
-            
-    #         if existing is None or existing.empty:
-    #             existing = pd.DataFrame(columns=["epid_number", "version"])
-            
-    #         if "epid_number" in df.columns:
-    #             df = df.merge(existing, on="epid_number", how="left")
-            
-    #         df["case_version"] = df["version"].fillna(0) + 1
-    #         df = df.convert_dtypes()
-    #         df = df.where(pd.notnull(df), None)
-
-    #         return make_xcom_safe(df).to_dict("records")
-    #     except Exception as e:
-    #         print(f"CRITICAL ERROR in apply_case_versioning: {str(e)}")
-    #         raise Exception(f"Error in apply_case_versioning: {str(e)}") from e
-
-    # # -------------------------
-    # Bulk Load
-    # -------------------------
+    
     @task
     def load_lassa_fever_data(records):
         conn = None
@@ -426,7 +382,7 @@ def lassa_pipeline():
                 print("WARNING: load_lassa_fever_data received empty list, returning empty DataFrame")
                 return []
             
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
 
             for col in ["lga_id", "state_id","epi_week","epi_year"]:
                 if col in df.columns:
@@ -515,134 +471,53 @@ def lassa_pipeline():
                     conn.close()
                 except:
                     pass
-    # @task
-    # def load_lassaFever_extension_table(records, inserted_cases_df):
-    #     conn = None
-    #     cur = None
-    #     try:
-    #         if not inserted_cases_df:
-    #             return 0
-            
-    #         df = pd.DataFrame(records)
-    #         inserted_cases = pd.DataFrame(inserted_cases_df)
-            
-    #         if "epid_number" not in df.columns or "epid_number" not in inserted_cases.columns:
-    #             raise Exception("Missing epid_number column for merge")
-            
-    #         df = df.merge(inserted_cases, on="epid_number", how="inner")
-            
-    #         if df.empty:
-    #             raise Exception("No matching records after merge with inserted cases")
-            
-    #         required_lassa_cols = [
-    #             "case_fact_id", "epi", "serial", "laboratory", "laboratory_assigned_specimen_id", "village_town",
-    #             "facility_referred_from", "specimen_type", "initial_repeat_follow_up_sample", "date_of_specimen_collection",
-    #             "tranex_courier_yes_no", "way_bill_number_of_the_package_containing_the_sample_if_yes",
-    #             "weight_of_the_package_containing_the_sample_in_kilogram_if_yes", "date_specimen_received_at_lab", "date_specimen_tested",
-    #             "ct_value_qrt_pcr_i_target", "ct_value_qrt_pcr_ii_target", "result_intepretation_positive_negative_or_rejected", "comments",
-    #             "malaria_result_positive_negative_not_done_not_applicable", "other_tests_done_list"
-    #         ]
-            
-    #         available_cols = [col for col in required_lassa_cols if col in df.columns]
-    #         if not available_cols:
-    #             raise Exception(f"None of the required columns found in data")
-            
-    #         lassa_df = df[available_cols].copy()
-            
-    #         hook = PostgresHook(postgres_conn_id=dw_conn_id)
-    #         conn = hook.get_conn()
-    #         cur = conn.cursor()
+    
 
-    #         buffer = io.StringIO()
-    #         lassa_df.to_csv(buffer, index=False, header=False)
-    #         buffer.seek(0)
-
-    #         cur.execute("""
-    #         CREATE TEMP TABLE tmp_ext_lassa_case (
-    #             case_id INT, case_identifier VARCHAR (50), serial_number VARCHAR (50), laboratory VARCHAR (100),
-    #             lab_assigned_id VARCHAR (50), village_town VARCHAR (100), facility_referred_from VARCHAR (100),
-    #             sample_type VARCHAR (50), initial_repeat_followup VARCHAR (50), date_specimen_collection date,
-    #             tranex_courier boolean, waybill_number VARCHAR (100), package_weight_kg VARCHAR (20),
-    #             date_specimen_received date, date_specimen_tested date, ct_value_qrt_pcr_i VARCHAR (50),
-    #             ct_value_qrt_pcr_ii VARCHAR (50), result_interpretation VARCHAR (20), comments VARCHAR(100),
-    #             malaria_result VARCHAR (20), other_tests_done VARCHAR(100)
-    #         ) ON COMMIT DROP
-    #         """)
-
-    #         cur.copy_expert("""
-    #         COPY tmp_ext_lassa_case (case_id,case_identifier, serial_number, laboratory, lab_assigned_id,
-    #         village_town,facility_referred_from,sample_type,initial_repeat_followup, date_specimen_collection,tranex_courier,waybill_number,
-    #         package_weight_kg,date_specimen_received,date_specimen_tested, ct_value_qrt_pcr_i,ct_value_qrt_pcr_ii,result_interpretation,
-    #         comments,malaria_result,other_tests_done)
-    #         FROM STDIN WITH CSV
-    #         """, buffer)
-
-    #         cur.execute("""
-    #         INSERT INTO ext_lassa_case (case_id,case_identifier, serial_number, laboratory, lab_assigned_id,
-    #         village_town,facility_referred_from,sample_type,initial_repeat_followup, date_specimen_collection,tranex_courier,waybill_number,
-    #         package_weight_kg,date_specimen_received,date_specimen_tested, ct_value_qrt_pcr_i,ct_value_qrt_pcr_ii,result_interpretation,
-    #         comments,malaria_result,other_tests_done)
-    #         SELECT case_id,case_identifier, serial_number, laboratory, lab_assigned_id,
-    #             village_town,facility_referred_from,sample_type,initial_repeat_followup, date_specimen_collection,tranex_courier,waybill_number,
-    #             package_weight_kg,date_specimen_received,date_specimen_tested, ct_value_qrt_pcr_i,ct_value_qrt_pcr_ii,result_interpretation,
-    #             comments,malaria_result,other_tests_done
-    #         FROM tmp_ext_lassa_case
-    #         """)
-            
-    #         conn.commit()
-    #         return len(inserted_cases)
-    #     except Exception as e:
-    #         if conn:
-    #             conn.rollback()
-    #         raise Exception(f"Error in load_lassaFever_extension_table: {str(e)}") from e
-    #     finally:
-    #         if conn:
-    #             try:
-    #                 if cur:
-    #                     cur.close()
-    #                 conn.close()
-    #             except:
-    #                 pass
-
-    # -------------------------
-    # Run Logging - End
-    # -------------------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
-    def end_run(records, loaded_cases, etl_run_id, **context):
+    def cleanup_temp(records):
+
+        try:
+            if records and os.path.exists(records["path"]):
+                os.remove(records["path"])
+        except Exception as e:
+            print(f"Cleanup warning: {e}")
+
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def end_run(loaded_cases, etl_run_id, **context):
         conn = None
         cur = None
         try:
-            extracted_count = len(records) if records else 0
-            if loaded_cases:
+            loaded_count = len(loaded_cases) if loaded_cases else 0
 
-                hook = PostgresHook(postgres_conn_id=dw_conn_id)
-                conn = hook.get_conn()
-                cur = conn.cursor()
+            hook = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = hook.get_conn()
+            cur = conn.cursor()
 
-                try:
-                    cur.execute("""
-                        SELECT COUNT(*)
-                        FROM etl_task_failures
-                        WHERE run_id = %s
-                    """, (context.get("run_id", etl_run_id),))
-                    
-                    result = cur.fetchone()
-                    failure_count = result[0] if result else 0
-                except Exception as query_error:
-                    print(f"Warning: Could not query task failures: {str(query_error)}")
-                    failure_count = 0
-
-                status = "FAILED" if failure_count > 0 else "SUCCESS"
-                
+            try:
                 cur.execute("""
-                    UPDATE etl_run_log
-                    SET end_time = NOW(),
-                        status=%s,
-                        records_extracted = %s          
-                    WHERE run_id=%s
-                """, (status, extracted_count, etl_run_id))
+                    SELECT COUNT(*)
+                    FROM etl_task_failures
+                    WHERE run_id = %s
+                """, (context.get("run_id", etl_run_id),))
+                
+                result = cur.fetchone()
+                failure_count = result[0] if result else 0
+            except Exception as query_error:
+                print(f"Warning: Could not query task failures: {str(query_error)}")
+                failure_count = 0
+            
+            status = "FAILED" if failure_count > 0 else "SUCCESS"
 
-                conn.commit()
+            cur.execute("""
+                UPDATE etl_run_log
+                SET end_time = NOW(),
+                    status=%s,
+                    records_loaded = %s
+                WHERE run_id=%s and status = 'running'
+            """, (status, loaded_count, etl_run_id))
+
+            conn.commit()        
+       
         except Exception as e:
             if conn:
                 conn.rollback()
@@ -665,17 +540,12 @@ def lassa_pipeline():
 
     cleaned = clean_data(records)
 
-    # validated = validate_data(cleaned)
-
-    # deduped = deduplicate(validated)
-
     resolved = resolve_dimensions(cleaned)
 
-    # versioned = apply_case_versioning(resolved)
-
     loaded_data = load_lassa_fever_data(resolved)
-
-    end_run(records, loaded_data, run )
-
+    cleaned = cleanup_temp(resolved)
+    loaded_data >> cleaned
+    end = end_run(loaded_data, run )
+    cleaned >> end
 
 lassa_pipeline()
