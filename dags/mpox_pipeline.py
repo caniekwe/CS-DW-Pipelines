@@ -1,15 +1,16 @@
-from airflow.decorators import dag, task
+import os
+from airflow.sdk import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.utils.trigger_rule import TriggerRule
-from airflow.models import DagRun
+from airflow.task.trigger_rule import TriggerRule
+from airflow.exceptions import AirflowSkipException
 from datetime import datetime
 import pandas as pd
 import numpy as np
 import io
-import os
 import json
 import re 
 from difflib import SequenceMatcher
+import tempfile
 
 DAG_ID = "mpox_linelist_pipeline"
 staging_conn_id = "staging_postgres_db"
@@ -19,18 +20,20 @@ dw_conn_id = "dw_postgres"
 def log_task_failure(context):
     try:
         ti = context["task_instance"]
-        dag_run = context["dag_run"]
         hook = PostgresHook(postgres_conn_id=dw_conn_id)
         conn = hook.get_conn()
         cur = conn.cursor()
-        
+
         error_msg = str(context.get("exception", "Unknown error"))
-        
+
+
+        etl_run_id = ti.xcom_pull(task_ids="start_run", key="return_value")
+
         cur.execute("""
             INSERT INTO etl_task_failures (
                 dag_id,
                 task_id,
-                run_id,
+                etl_run_id,
                 error_message,
                 failure_time
             )
@@ -38,7 +41,7 @@ def log_task_failure(context):
         """, (
             ti.dag_id,
             ti.task_id,
-            dag_run.run_id,
+            etl_run_id,
             error_msg
         ))
         conn.commit()
@@ -49,20 +52,21 @@ def log_task_failure(context):
         import traceback
         traceback.print_exc()
 
-# Return XCom safe data by converting datetimes to strings and ensuring all data is JSON serializable
-def make_xcom_safe(df):
-    df = df.copy()
-    for col in df.columns:
-        # Convert datetime/date columns to string
-        if "datetime" in str(df[col].dtype) or df[col].dtype == "object":
-            df[col] = df[col].apply(
-                lambda x: x.isoformat() if hasattr(x, "isoformat") else x
+def mark_run_skipped(etl_run_id):
+    hook = PostgresHook(postgres_conn_id=dw_conn_id)
+
+    with hook.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE etl_run_log
+                SET end_time = NOW(),
+                    status = 'SKIPPED'
+                WHERE run_id = %s
+                  AND status = 'RUNNING'
+                """,
+                (etl_run_id,),
             )
-
-    # Replace NaN / NaT with None
-    df = df.replace({np.nan: None})
-
-    return df
 
 DAG_DIR = os.path.dirname(os.path.abspath(__file__))
 COLUMN_MAPPING_FILE = os.path.join(DAG_DIR, "column_mappings.json")
@@ -126,7 +130,7 @@ def fuzzy_match_column(normalized_col, synonym_lookup, threshold=85):
     return None, best_score
 
 
-def apply_column_mapping(df, required_columns=None, fuzzy_threshold=85):
+def apply_column_mapping(df, fuzzy_threshold=85):
     
     df = df.copy()
 
@@ -179,7 +183,10 @@ def apply_column_mapping(df, required_columns=None, fuzzy_threshold=85):
     start_date=datetime(2026,1,1),
     schedule="0 * * * *",
     catchup=False,
-    tags=["line list","mpox"]
+    tags=["line list","mpox"],
+    default_args={
+        "on_failure_callback": log_task_failure
+    }
 )
 
 def mpox_pipeline():
@@ -189,8 +196,6 @@ def mpox_pipeline():
     # -------------------------
     @task
     def start_run(**context):
-        dag_run = context["dag_run"]
-        status = dag_run.state
         hook = PostgresHook(postgres_conn_id=dw_conn_id)
 
         conn = hook.get_conn()
@@ -204,7 +209,7 @@ def mpox_pipeline():
         """,
         (
             DAG_ID,
-            status
+            "RUNNING"
         ))
 
         etl_run_id = cur.fetchone()[0]
@@ -218,50 +223,86 @@ def mpox_pipeline():
         BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         try:
             if not started:
-                return []
+                raise ValueError(f"Pipeline did not start properly, no etl_run_id found")
             staging = PostgresHook(postgres_conn_id=staging_conn_id)
-            sql = "SELECT stored_path FROM file_uploads WHERE primary_disease ='mpox' AND file_type='disease_line_list' ORDER BY uploaded_at DESC LIMIT 1"
+            sql = "SELECT stored_path, id FROM file_uploads WHERE primary_disease ='mpox' AND file_type='disease_line_list' ORDER BY uploaded_at DESC LIMIT 1"
             df = staging.get_pandas_df(sql)
             if df is None or df.empty:
-                return []
+                mark_run_skipped(started)
+                raise AirflowSkipException(f"There is no upload record for Mpox found in the staging database")
             else:
                 stored_path = df.iloc[0]["stored_path"]
+                file_id = int(df.iloc[0]["id"])
                 if not stored_path:
-                    return []                
-                
+                    raise ValueError(f"No file path recorded for this file")
+                if not file_id:
+                    raise ValueError(f"File ID is not recorded for this file")
                 hook = PostgresHook(postgres_conn_id=dw_conn_id)
                 conn = hook.get_conn()
                 #check if file has been processed before
                 file_name = os.path.basename(stored_path)
 
-                sql_check = "SELECT count(*) FROM etl_run_log WHERE file_name = %s and status = 'SUCCESS'"
-                check = hook.get_pandas_df(sql_check, parameters= (file_name,))
-                if check is None or check.empty:
-                    return []
-                else:
+                sql_check = "SELECT count(*) FROM etl_run_log WHERE file_name = %s and file_upload_id = %s and status = 'SUCCESS'"
+                check = hook.get_pandas_df(sql_check, parameters= (file_name, file_id))
+
+                if check is not None and not check.empty:
                     count = check.iloc[0][0]
                     if count > 0:
-                        return []
+                        cur = conn.cursor()
+                        cur.execute("""
+                                UPDATE etl_run_log
+                                SET end_time = NOW(),
+                                    file_name = %s,
+                                    file_upload_id = %s,
+                                    status=%s,
+                                    records_extracted = %s
+                                WHERE run_id=%s
+                            """, (file_name, file_id, 'SKIPPED', 0, started))
+
+                        conn.commit()
+                        raise AirflowSkipException(f"File {file_name} has already been processed")
                     else:
                         full_path = os.path.join(BASE_DIR, stored_path)
-                        root, file_ext = os.path.splitext(file_name)
+                        file_ext = os.path.splitext(file_name)[1].lower()
                         if file_ext == '.csv':
                             line_list_data = pd.read_csv(full_path)
                         elif file_ext in ['.xlsx', '.xls']:
                             line_list_data = pd.read_excel(full_path)
-                        
+                        else:
+                            raise ValueError(f"Unsupported file extension '{file_ext}' for {file_name}")
+
                         if line_list_data is None or line_list_data.empty:
-                            return []
+                            raise ValueError(f"{file_name} is empty or has no data")
                         else:
                             cur = conn.cursor()
                             cur.execute("""
                                     UPDATE etl_run_log
-                                    SET file_name = %s        
+                                    SET file_name = %s,
+                                        file_upload_id = %s,
+                                        records_extracted = %s
                                     WHERE run_id=%s
-                                """, (file_name, started))
+                                """, (file_name, file_id, len(line_list_data), started))
                             
                             conn.commit()
-                            return make_xcom_safe(line_list_data).to_dict("records")
+                            tmp_file = tempfile.NamedTemporaryFile(
+                                suffix=".parquet",
+                                prefix=f"mpox_{started}_",
+                                delete=False
+                            )
+                            object_cols = line_list_data.select_dtypes(include=["object"]).columns
+
+                            for col in object_cols:
+                                line_list_data[col] = line_list_data[col].astype(str)
+                           
+                            line_list_data.to_parquet(tmp_file.name, index=False)
+
+                            return {
+                                "run_id": started,
+                                "path": tmp_file.name,
+                                "rows": len(line_list_data)
+                            }
+        except AirflowSkipException:
+            raise
         except Exception as e:
             raise Exception(f"Error in extract data from the staging db: {str(e)}") from e
 
@@ -269,11 +310,10 @@ def mpox_pipeline():
     def clean_data(records):
         try:
             if not records:
-                return []
-            df = pd.DataFrame(records)
+                raise ValueError("clean_data received empty list")
+            df = pd.read_parquet(records["path"])
 
-            required_columns = ["LGA", "Date of Symptom Onset", "State", "Result Intepretation MPX (Positive, Negative, Indeterminate or Pending)"]
-            df = apply_column_mapping(df, required_columns=required_columns, fuzzy_threshold=85)
+            df = apply_column_mapping(df, fuzzy_threshold=85)
 
             df.replace("null", pd.NA, inplace=True)
 
@@ -291,7 +331,8 @@ def mpox_pipeline():
                         (df["result"].str.lower() == "positive"), "confirmed","suspected"
                 )                
             
-            return make_xcom_safe(df).to_dict("records")
+            df.to_parquet(records["path"], index=False)
+            return records
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
 
@@ -300,9 +341,9 @@ def mpox_pipeline():
         try:
             if not records:
                 print("WARNING: resolve_dimensions received empty list, returning empty")
-                return []
+                raise ValueError("resolve_dimensions received empty list")
             
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
             dw = PostgresHook(postgres_conn_id=dw_conn_id)
 
             states = dw.get_pandas_df("SELECT state_id,state_name FROM master_state")
@@ -340,19 +381,25 @@ def mpox_pipeline():
                     df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
                    
-            return make_xcom_safe(df).to_dict("records")
+            df.to_parquet(records["path"], index=False)       
+            return records
         except Exception as e:
             print(f"CRITICAL ERROR in resolve_dimensions: {str(e)}")
             raise Exception(f"Error in resolve_dimensions: {str(e)}") from e
 
     @task
     def load_mpox_data(records):
+        conn = None
+        cur = None
         try:
+            warehouse = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = warehouse.get_conn()
+            cur = conn.cursor()
             if not records:
                 print("WARNING: load_mpox_data received empty list, returning empty DataFrame")
-                return []
+                raise ValueError("load_mpox_data received empty list, cannot proceed with loading data")
             
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
 
             for col in ["lga_id", "state_id"]:
                 if col in df.columns:
@@ -367,9 +414,7 @@ def mpox_pipeline():
             fact_df = df[required_cols].copy()
             fact_df.columns = ["disease_id", "onset_date", "lga_id", "state_id", "case_classification"]
 
-            warehouse = PostgresHook(postgres_conn_id=dw_conn_id)
-            conn = warehouse.get_conn()
-            cur = conn.cursor()
+            
 
             cur.execute("""
                         CREATE TEMP TABLE tmp_core_surveillance_fact (
@@ -428,52 +473,61 @@ def mpox_pipeline():
                 """
             )
             conn.commit()
-            cur.close()
-            conn.close()
             return True
         except Exception as e:
             raise Exception(f"Error in aggregating mpox surveillance data from the data warehouse: {str(e)}") from e
 
+        finally:
+            if conn:
+                try:
+                    if cur:
+                        cur.close()
+                    conn.close()
+                except:
+                    pass
 
-    # # -------------------------
-    # Run Logging - End
-    # -------------------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
-    def end_run(records, loaded_data, etl_run_id, **context):
+    def cleanup_temp(records):
+
+        try:
+            if records and os.path.exists(records["path"]):
+                os.remove(records["path"])
+        except Exception as e:
+            print(f"Cleanup warning: {e}")
+
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def end_run(etl_run_id, **context):
         conn = None
         cur = None
         try:
-            extracted_count = len(records) if records else 0
-            if loaded_data:
+            #loaded_count = len(loaded_cases) if loaded_cases else 0
 
-                hook = PostgresHook(postgres_conn_id=dw_conn_id)
-                conn = hook.get_conn()
-                cur = conn.cursor()
+            hook = PostgresHook(postgres_conn_id=dw_conn_id)
+            conn = hook.get_conn()
+            cur = conn.cursor()
 
-                try:
-                    cur.execute("""
-                        SELECT COUNT(*)
-                        FROM etl_task_failures
-                        WHERE run_id = %s
-                    """, (context.get("run_id", etl_run_id),))
-                    
-                    result = cur.fetchone()
-                    failure_count = result[0] if result else 0
-                except Exception as query_error:
-                    print(f"Warning: Could not query task failures: {str(query_error)}")
-                    failure_count = 0
 
-                status = "FAILED" if failure_count > 0 else "SUCCESS"
-                
-                cur.execute("""
-                    UPDATE etl_run_log
-                    SET end_time = NOW(),
-                        status=%s,
-                        records_extracted = %s          
-                    WHERE run_id=%s
-                """, (status, extracted_count, etl_run_id))
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM etl_task_failures
+                WHERE etl_run_id = %s
+            """, ( etl_run_id,))
 
-                conn.commit()
+            result = cur.fetchone()
+            failure_count = result[0] if result else 0
+
+
+            status = "FAILED" if failure_count > 0 else "SUCCESS"
+
+            cur.execute("""
+                UPDATE etl_run_log
+                SET end_time = NOW(),
+                    status=%s
+                WHERE run_id=%s and status = 'RUNNING'
+            """, (status, etl_run_id))
+
+            conn.commit()        
+       
         except Exception as e:
             if conn:
                 conn.rollback()
@@ -491,16 +545,13 @@ def mpox_pipeline():
     # DAG dependency flow
 
     run = start_run()
-
     records = extract_data(run)
-    
     cleaned_data = clean_data(records)
-
     resolved = resolve_dimensions(cleaned_data)
-
     loaded_data =load_mpox_data(resolved)
+    end = end_run(run)
+    cleanup = cleanup_temp(records)
 
-    end_run(records, loaded_data, run )
-
+    loaded_data >> end >> cleanup
 
 mpox_pipeline()

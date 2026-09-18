@@ -76,7 +76,8 @@
         "test result",
         "result intepretation positive negative or rejected",
         "result intepretation",
-        "IgM result"
+        "IgM result",
+        "RDTResult"
     ],
     "case_classification": [
         "case classification",
