@@ -1,0 +1,128 @@
+# Deployment scaffold - NOT WIRED UP YET.
+#
+# This workflow only ever runs when you start it by hand (Actions > Deploy > Run
+# workflow). Nothing here fires on a push or a merge.
+#
+# What works today: it builds the image and pushes it to GHCR, tagged with the commit
+# SHA, so every deployable build has an immutable address.
+#
+# What you still have to fill in: the "Apply to host" step in each deploy job. Until
+# you do, those steps just print the commands a human would run. See the block marked
+# TODO(deploy).
+#
+# Before the first production run, create the two environments under
+# Settings > Environments:
+#   staging     - no protection needed
+#   production  - add yourself as a required reviewer, so production waits for approval
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "How far to roll this out"
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - staging-and-production
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: staging
+    steps:
+      - name: Apply to host
+        # TODO(deploy): replace this with the real rollout once the target is chosen.
+        #
+        # If you go the SSH route, it becomes roughly:
+        #   - uses: appleboy/ssh-action@v1
+        #     with:
+        #       host: ${{ secrets.STAGING_HOST }}
+        #       username: ${{ secrets.STAGING_USER }}
+        #       key: ${{ secrets.STAGING_SSH_KEY }}
+        #       script: |
+        #         cd /opt/airflow-docker
+        #         git pull --ff-only
+        #         docker compose pull && docker compose up -d --remove-orphans
+        #
+        # If you install a self-hosted runner on the Airflow box instead, drop the SSH
+        # action, set `runs-on: [self-hosted, staging]` above, and run those same
+        # docker compose commands directly.
+        run: |
+          echo "::notice::Deploy is not wired up yet - nothing was changed on staging."
+          echo "Image built and pushed for this commit:"
+          echo "  ${{ needs.build-and-push.outputs.image }}"
+          echo
+          echo "To roll it out by hand, on the staging host:"
+          echo "  cd /opt/airflow-docker && git pull --ff-only"
+          echo "  docker compose pull && docker compose up -d --remove-orphans"
+
+  deploy-production:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-staging]
+    if: inputs.target == 'staging-and-production'
+    # With a required reviewer on this environment, the run pauses here until approved.
+    environment: production
+    steps:
+      - name: Apply to host
+        # TODO(deploy): same as staging, against the production host/secrets.
+        run: |
+          echo "::notice::Deploy is not wired up yet - nothing was changed in production."
+          echo "Image built and pushed for this commit:"
+          echo "  ${{ needs.build-and-push.outputs.image }}"
+          echo
+          echo "To roll it out by hand, on the production host:"
+          echo "  cd /opt/airflow-docker && git pull --ff-only"
+          echo "  docker compose pull && docker compose up -d --remove-orphans"
