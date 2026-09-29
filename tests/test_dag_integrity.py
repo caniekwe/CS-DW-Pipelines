@@ -31,7 +31,7 @@ NON_DAG_MODULES: set[str] = set()
 # DAGs that predate the standard failure-logging callback. Remove an entry once the
 # DAG sets on_failure_callback in its default_args - test_failure_callback_allowlist_is_current
 # fails if an entry here is no longer needed, so the list cannot go stale.
-DAGS_WITHOUT_FAILURE_CALLBACK = {"hr_pipeline"}
+DAGS_WITHOUT_FAILURE_CALLBACK: set[str] = set()
 
 DAGBAG = DagBag(dag_folder=str(DAG_FOLDER), include_examples=False)
 
