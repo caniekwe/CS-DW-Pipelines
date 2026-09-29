@@ -1,33 +1,35 @@
-from airflow.decorators import dag, task
+import os
+from airflow.sdk import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.utils.trigger_rule import TriggerRule
-from airflow.models import DagRun
+from airflow.task.trigger_rule import TriggerRule
+from airflow.exceptions import AirflowSkipException
 from datetime import datetime
 import pandas as pd
-import numpy as np
 import io
+import tempfile
 
 
 DAG_ID = "hr_pipeline"
 staging_conn_id = "staging_postgres_db"
 dw_conn_id = "dw_postgres"
 
-# Failure callback
 def log_task_failure(context):
     try:
         ti = context["task_instance"]
-        dag_run = context["dag_run"]
         hook = PostgresHook(postgres_conn_id=dw_conn_id)
         conn = hook.get_conn()
         cur = conn.cursor()
-        
+
         error_msg = str(context.get("exception", "Unknown error"))
-        
+
+
+        etl_run_id = ti.xcom_pull(task_ids="start_run", key="return_value")
+
         cur.execute("""
             INSERT INTO etl_task_failures (
                 dag_id,
                 task_id,
-                run_id,
+                etl_run_id,
                 error_message,
                 failure_time
             )
@@ -35,7 +37,7 @@ def log_task_failure(context):
         """, (
             ti.dag_id,
             ti.task_id,
-            dag_run.run_id,
+            etl_run_id,
             error_msg
         ))
         conn.commit()
@@ -46,27 +48,33 @@ def log_task_failure(context):
         import traceback
         traceback.print_exc()
 
-# Return XCom safe data by converting datetimes to strings and ensuring all data is JSON serializable
-def make_xcom_safe(df):
-    df = df.copy()
-    for col in df.columns:
-        # Convert datetime/date columns to string
-        if "datetime" in str(df[col].dtype) or df[col].dtype == "object":
-            df[col] = df[col].apply(
-                lambda x: x.isoformat() if hasattr(x, "isoformat") else x
+def mark_run_skipped(etl_run_id):
+    hook = PostgresHook(postgres_conn_id=dw_conn_id)
+
+    with hook.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE etl_run_log
+                SET end_time = NOW(),
+                    status = 'SKIPPED'
+                WHERE run_id = %s
+                  AND status = 'RUNNING'
+                """,
+                (etl_run_id,),
             )
+# Return XCom safe data by converting datetimes to strings and ensuring all data is JSON serializable
 
-    # Replace NaN / NaT with None
-    df = df.replace({np.nan: None})
-
-    return df
 
 @dag(
     dag_id=DAG_ID,
     start_date=datetime(2026,1,1),
     schedule="0 * * * *",
     catchup=False,
-    tags=["human resources"]
+    tags=["human resources"],
+    default_args={
+        "on_failure_callback": log_task_failure
+    }
 )
 
 def hr_pipeline():
@@ -76,8 +84,6 @@ def hr_pipeline():
     # -------------------------
     @task
     def start_run(**context):
-        dag_run = context["dag_run"]
-        status = dag_run.state
         hook = PostgresHook(postgres_conn_id=dw_conn_id)
 
         conn = hook.get_conn()
@@ -91,7 +97,7 @@ def hr_pipeline():
         """,
         (
             DAG_ID,
-            status
+            "RUNNING"
         ))
 
         etl_run_id = cur.fetchone()[0]
@@ -106,15 +112,89 @@ def hr_pipeline():
     # -------------------------
     @task
     def extract_data(started):
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         try:
             if not started:
-                return []
+                raise ValueError(f"Pipeline did not start properly, no etl_run_id found")
             staging = PostgresHook(postgres_conn_id=staging_conn_id)
-            sql = "SELECT * FROM hr_data"
+            sql = "SELECT stored_path, id FROM file_uploads WHERE file_type='hr_data' ORDER BY uploaded_at DESC LIMIT 1"
             df = staging.get_pandas_df(sql)
             if df is None or df.empty:
-                return []
-            return df.to_dict("records")
+                mark_run_skipped(started)
+                raise AirflowSkipException(f"There is no upload record found in the staging database")
+            else:
+                stored_path = df.iloc[0]["stored_path"]
+                file_id = int(df.iloc[0]["id"])
+                if not stored_path:
+                    raise ValueError(f"No file path recorded for this file")
+                if not file_id:
+                    raise ValueError(f"File ID is not recorded for this file")
+                hook = PostgresHook(postgres_conn_id=dw_conn_id)
+                conn = hook.get_conn()
+                #check if file has been processed before
+                file_name = os.path.basename(stored_path)
+
+                sql_check = "SELECT count(*) FROM etl_run_log WHERE file_name = %s and file_upload_id = %s and status = 'SUCCESS'"
+                check = hook.get_pandas_df(sql_check, parameters= (file_name, file_id))
+
+                if check is not None and not check.empty:
+                    count = check.iloc[0][0]
+                    if count > 0:
+                        cur = conn.cursor()
+                        cur.execute("""
+                                UPDATE etl_run_log
+                                SET end_time = NOW(),
+                                    file_name = %s,
+                                    file_upload_id = %s,
+                                    status=%s,
+                                    records_extracted = %s
+                                WHERE run_id=%s
+                            """, (file_name, file_id, 'SKIPPED', 0, started))
+
+                        conn.commit()
+                        raise AirflowSkipException(f"File {file_name} has already been processed")
+                    else:
+                        full_path = os.path.join(BASE_DIR, stored_path)
+                        file_ext = os.path.splitext(file_name)[1].lower()
+                        if file_ext == '.csv':
+                            hr_data = pd.read_csv(full_path)
+                        elif file_ext in ['.xlsx', '.xls']:
+                            hr_data = pd.read_excel(full_path)
+                        else:
+                            raise ValueError(f"Unsupported file extension '{file_ext}' for {file_name}")
+
+                        if hr_data is None or hr_data.empty:
+                            raise ValueError(f"{file_name} is empty or has no data")
+                        else:
+                            cur = conn.cursor()
+                            cur.execute("""
+                                    UPDATE etl_run_log
+                                    SET file_name = %s,
+                                        file_upload_id = %s,
+                                        records_extracted = %s
+                                    WHERE run_id=%s
+                                """, (file_name, file_id, len(hr_data), started))
+                            
+                            conn.commit()
+                            tmp_file = tempfile.NamedTemporaryFile(
+                                suffix=".parquet",
+                                prefix=f"cholera_{started}_",
+                                delete=False
+                            )
+                            object_cols = hr_data.select_dtypes(include=["object"]).columns
+
+                            for col in object_cols:
+                                hr_data[col] = hr_data[col].astype(str)
+                           
+                            hr_data.to_parquet(tmp_file.name, index=False)
+
+                            return {
+                                "run_id": started,
+                                "path": tmp_file.name,
+                                "rows": len(hr_data)
+                            }
+        except AirflowSkipException:
+            raise
         except Exception as e:
             raise Exception(f"Error in extract data from the staging db: {str(e)}") from e
 
@@ -122,9 +202,8 @@ def hr_pipeline():
     def clean_data(records):
         try:
             if not records:
-                print("WARNING: clean_data received empty list, returning empty")
-                return []
-            df = pd.DataFrame(records)
+                raise ValueError("clean_data received empty list")
+            df = pd.read_parquet(records["path"])
             df.replace("null", pd.NA, inplace=True)
             
             dw = PostgresHook(postgres_conn_id=dw_conn_id)
@@ -172,143 +251,36 @@ def hr_pipeline():
             else:
                 raise Exception("Missing 'department' column in data")
             
-            return make_xcom_safe(df).to_dict("records")
+            df.to_parquet(records["path"], index=False)
+            return records
 
         except Exception as e:
             raise Exception(f"Error in clean_data: {str(e)}") from e
     
-    # -------------------------
-    # Validation
-    # -------------------------
-    # @task
-    # def validate_data(records, **context):
-        # conn = None
-        # try:
-        #     if not records:
-        #         return []
-            
-        #     df = pd.DataFrame(records)
-        #     dag_run = context["dag_run"]   
-        #     ti = context["task_instance"]     
-
-        #    # valid_rows = []
-        #     failures = []
-            
-        #     for idx, row in df.iterrows():
-        #         try:
-        #             age = pd.to_numeric(row.get("age"), errors="coerce")
-
-        #             if pd.isna(row.get("state")) and pd.isna(row.get("lga")):
-        #                 failures.append((int(idx),"Missing location",dag_run.run_id, ti.dag_id))
-
-        #             elif pd.isna(age) or age < 0 or age > 120: 
-        #                 failures.append((int(idx),"Invalid age",dag_run.run_id, ti.dag_id))
-
-        #             elif pd.isna(row.get("epid_number")):
-        #                 failures.append((int(idx),"Missing Epid number",dag_run.run_id, ti.dag_id))
-        #             else:
-        #                 # valid_rows.append(row)
-        #                 pass
-        #         except Exception as row_error:
-        #             print(f"Row {idx} failed with error: {row_error}")
-        #             failures.append((int(idx),f"Row processing error: {str(row_error)}",dag_run.run_id, ti.dag_id))
-        #     if failures:
-        #         try:
-        #             hook = PostgresHook(postgres_conn_id=dw_conn_id)
-        #             conn = hook.get_conn()
-        #             cur = conn.cursor()
-        #             cur.executemany("""
-        #             INSERT INTO etl_validation_failures
-        #             (row_number,failure_reason, run_id, dag_id)
-        #             VALUES (%s,%s,%s,%s)
-        #             """, failures)
-        #             conn.commit()
-        #         except Exception as db_error:
-        #             print(f"DB Error inserting validation failures: {str(db_error)}")
-        #             if conn:
-        #                 conn.rollback()
-        #             raise Exception(f"Error inserting validation failures: {str(db_error)}") from db_error
-        #         finally:
-        #             if conn:
-        #                 try:
-        #                     conn.close()
-        #                 except:
-        #                     pass
-
-        #     df_valid = make_xcom_safe(df)
-            
-        #     return df_valid.to_dict("records")
-            
-            
-        # except Exception as e:
-        #     print(f"CRITICAL ERROR in validate_data: {str(e)}")
-        #     raise Exception(f"Error in validate_data: {str(e)}") from e
-
-
-        # -------------------------
    
-    # -------------------------
-    # Case Versioning
-    # -------------------------
-    @task
-    def apply_record_versioning(records):
-
-        try:
-            if not records:
-                print("WARNING: apply_record_versioning received empty list, returning empty")
-                return []
-            
-            df = pd.DataFrame(records)
-            dw = PostgresHook(postgres_conn_id=dw_conn_id)
-
-            try:
-                existing = dw.get_pandas_df("SELECT file_no, MAX(record_version) AS version FROM core_hr_fact GROUP BY file_no")
-            except Exception as query_error:
-                print(f"Warning: Could not query existing record versions: {str(query_error)}")
-                existing = None
-            
-            if existing is None or existing.empty:
-                existing = pd.DataFrame(columns=["file_no", "version"])
-            
-            if "file_no" in df.columns:
-                df = df.merge(existing, on="file_no", how="left")
-            
-            df["record_version"] = df["version"].fillna(0) + 1
-            df = df.convert_dtypes()
-            df = df.where(pd.notnull(df), None)
-
-            return make_xcom_safe(df).to_dict("records")
-        except Exception as e:
-            print(f"CRITICAL ERROR in apply_record_versioning: {str(e)}")
-            raise Exception(f"Error in apply_record_versioning: {str(e)}") from e
-
-
-    # -------------------------
-    # Bulk Load
-    # -------------------------
+   
     @task
     def load_hr_fact_table(records):
         conn = None
         cur = None
         try:
             if not records:
-                print("WARNING: load_hr_fact_table received empty list, returning empty DataFrame")
-                return pd.DataFrame(columns=["case_fact_id", "epid_number"])
+                raise ValueError("load_hr_fact_table received empty list, cannot proceed with loading data")
             
-            df = pd.DataFrame(records)
+            df = pd.read_parquet(records["path"])
 
             for col in ["ippis", "department_id","lga_id","state_id"]:
                 if col in df.columns:
                     df[col] = df[col].astype("Int64")
             
-            required_cols = ["file_no", "ippis", "surname", "firstname", "othername", "rank", "sgl","department_id","primary_qualification","other_qualification", "date_of_birth", "date_of_1st_appt","date_of_appt_conf","lga_id","state_id","date_of_pp_appt","location","sex","years_in_service","record_version","staff_on_leave"]
+            required_cols = ["file_no", "ippis", "surname", "firstname", "othername", "rank", "sgl","department_id","primary_qualification","other_qualification", "date_of_birth", "date_of_1st_appt","date_of_appt_conf","lga_id","state_id","date_of_pp_appt","location","sex","years_in_service","staff_on_leave"]
 
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 raise Exception(f"Missing required columns: {missing_cols}")
             
             fact_df = df[required_cols].copy()
-            fact_df.columns = ["file_no", "ippis", "surname", "firstname", "othername", "rank", "sgl","department_id","primary_qualification","other_qualification", "date_of_birth", "date_of_1st_appt","date_of_appt_conf","lga_id","state_id","date_of_pp_appt","location","sex","years_in_service","record_version","staff_on_leave"]
+            fact_df.columns = ["file_no", "ippis", "surname", "firstname", "othername", "rank", "sgl","department_id","primary_qualification","other_qualification", "date_of_birth", "date_of_1st_appt","date_of_appt_conf","lga_id","state_id","date_of_pp_appt","location","sex","years_in_service","staff_on_leave"]
             
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
@@ -335,7 +307,6 @@ def hr_pipeline():
                 location VARCHAR(100),
                 sex VARCHAR(10),
                 years_in_service int,
-                record_version int,
                 leave_status VARCHAR(50)
             ) ON COMMIT DROP
             """)
@@ -349,7 +320,7 @@ def hr_pipeline():
             (file_no,ippis,surname,firstname,othername,
             rank,sgl,department,primary_qualification,other_qualification,
             date_of_birth,date_of_1st_appt,date_of_appt_conf,lga_of_origin,state_of_origin,
-            date_of_pp_appt,location,sex,years_in_service,record_version, leave_status)
+            date_of_pp_appt,location,sex,years_in_service, leave_status)
             FROM STDIN WITH CSV
             """, buffer)
 
@@ -358,11 +329,11 @@ def hr_pipeline():
             (file_no,ippis,surname,firstname,othername,
             rank,sgl,department,primary_qualification,other_qualification,
             date_of_birth,date_of_1st_appt,date_of_appt_conf,lga_of_origin,state_of_origin,
-            date_of_pp_appt,location,sex,years_in_service,record_version, leave_status)
+            date_of_pp_appt,location,sex,years_in_service,leave_status)
             SELECT file_no,ippis,surname,firstname,othername,
                 rank,sgl,department,primary_qualification,other_qualification,
                 date_of_birth,date_of_1st_appt,date_of_appt_conf,lga_of_origin,state_of_origin,
-                date_of_pp_appt,location,sex,years_in_service,record_version, leave_status
+                date_of_pp_appt,location,sex,years_in_service,leave_status
             FROM tmp_core_hr_fact
             ON CONFLICT (file_no) DO UPDATE
             SET
@@ -383,22 +354,13 @@ def hr_pipeline():
                 location = EXCLUDED.location,
                 sex = EXCLUDED.sex,
                 years_in_service = EXCLUDED.years_in_service,
-                record_version = EXCLUDED.record_version,
                 leave_status = EXCLUDED.leave_status
             RETURNING file_no, ippis
             """)
 
-            inserted_rows = cur.fetchall()
-            if not inserted_rows:
-                raise Exception("No rows inserted into core_hr_fact table")
-            
             conn.commit()
-            inserted_df = make_xcom_safe(pd.DataFrame(inserted_rows, columns=["file_no", "ippis"]))
-            return inserted_df.to_dict("records")
+            return True
         except Exception as e:
-            print(f"CRITICAL ERROR in load_core_hr_fact_table: {str(e)}")
-            if conn:
-                conn.rollback()
             raise Exception(f"Error in load_core_hr_fact_table: {str(e)}") from e
         finally:
             if conn:
@@ -409,46 +371,48 @@ def hr_pipeline():
                 except:
                     pass
 
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def cleanup_temp(records):
+
+        try:
+            if records and os.path.exists(records["path"]):
+                os.remove(records["path"])
+        except Exception as e:
+            print(f"Cleanup warning: {e}")
     # -------------------------
     # Run Logging - End
     # -------------------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
-    def end_run(records, loaded_records, etl_run_id, **context):
+    def end_run(etl_run_id, **context):
         conn = None
         cur = None
         try:
-            extracted_count = len(pd.DataFrame(records)) if not pd.DataFrame(records).empty else 0
-            loaded_count = len(pd.DataFrame(loaded_records)) if not pd.DataFrame(loaded_records).empty else 0
-
             hook = PostgresHook(postgres_conn_id=dw_conn_id)
             conn = hook.get_conn()
             cur = conn.cursor()
 
-            try:
-                cur.execute("""
-                    SELECT COUNT(*)
-                    FROM etl_task_failures
-                    WHERE run_id = %s
-                """, (context.get("run_id", etl_run_id),))
-                
-                result = cur.fetchone()
-                failure_count = result[0] if result else 0
-            except Exception as query_error:
-                print(f"Warning: Could not query task failures: {str(query_error)}")
-                failure_count = 0
+
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM etl_task_failures
+                WHERE etl_run_id = %s
+            """, ( etl_run_id,))
+
+            result = cur.fetchone()
+            failure_count = result[0] if result else 0
+
 
             status = "FAILED" if failure_count > 0 else "SUCCESS"
-            
+
             cur.execute("""
                 UPDATE etl_run_log
                 SET end_time = NOW(),
-                    status=%s,
-                    records_extracted = %s,
-                    records_loaded = %s           
-                WHERE run_id=%s
-            """, (status, extracted_count, loaded_count, etl_run_id))
+                    status=%s
+                WHERE run_id=%s and status = 'RUNNING'
+            """, (status, etl_run_id))
 
-            conn.commit()
+            conn.commit()        
+       
         except Exception as e:
             if conn:
                 conn.rollback()
@@ -467,15 +431,13 @@ def hr_pipeline():
 
     run = start_run()
 
-    records = extract_data(run)
-    
-    standardized = clean_data(records)
+    records = extract_data(run)    
+    cleaned_data = clean_data(records)
+    hr_fact = load_hr_fact_table(cleaned_data)
+    end = end_run(run )
+    cleanup = cleanup_temp(records)
 
-    versioned = apply_record_versioning(standardized)
-
-    hr_fact = load_hr_fact_table(versioned)
-
-    end_run(records, hr_fact, run )
+    hr_fact >> end >> cleanup
 
 
 hr_pipeline()
